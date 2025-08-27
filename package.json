@@ -1,0 +1,29 @@
+{
+  "name": "mobile-app-testing-mcp",
+  "version": "1.0.0",
+  "description": "移动端App测试MCP - 完整的移动应用安全测试和自动化平台",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "test": "node --test dist/test/*.js",
+    "setup": "chmod +x scripts/setup.sh && scripts/setup.sh",
+    "check": "node scripts/check-env.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "frida": "^16.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["mobile-testing", "app-security", "mcp", "frida", "adb", "android", "ios", "automation", "security-testing"],
+  "author": "",
+  "license": "MIT"
+}

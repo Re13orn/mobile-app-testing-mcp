@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__thinking__sequentialthinking",
+      "Bash(npm run build:*)",
+      "Bash(node:*)",
+      "Bash(grep:*)",
+      "Bash(npm start)",
+      "Bash(find:*)",
+      "Bash(\"/Users/reborn/RebornFile/hackoneTest/fridaMCP/jadx/bin/jadx\" --version)",
+      "Read(//Users/reborn/**)",
+      "Bash(chmod:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": [],
+    "additionalDirectories": [
+      "/Users/reborn/Library/Application Support/Claude"
+    ]
+  }
+}
