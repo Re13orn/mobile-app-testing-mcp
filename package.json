@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.js",
-    "start": "node dist/index.js",
-    "dev": "npm run build && node dist/index.js",
+    "start": "node scripts/start.js",
+    "dev": "npm run build && node scripts/start.js",
     "test": "node --test dist/test/*.js",
     "setup": "node scripts/setup.js",
     "setup:legacy": "chmod +x scripts/setup.sh && scripts/setup.sh",

@@ -99,7 +99,13 @@ export class AAPTManager {
 
     for (const path of possiblePaths) {
       try {
-        if (path && path.includes('build-tools') && !path.endsWith('.exe')) {
+        if (existsSync(path) && statSync(path).isFile()) {
+          const cmd = `"${path}" version`;
+          execSync(cmd, { stdio: 'ignore' });
+          this.aaptPath = path;
+          console.log(`[AAPT] 找到AAPT: ${path}`);
+          return;
+        } else if (path && path.includes('build-tools') && !path.endsWith('.exe')) {
           // 在build-tools目录中查找最新版本的aapt
           const buildToolsPath = this.findLatestBuildTools(path);
           if (buildToolsPath) {
