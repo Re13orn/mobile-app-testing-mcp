@@ -14,9 +14,15 @@ import { globalWorkflowManager } from './workflow-manager.js';
 import { globalAAPTManager } from './aapt-manager.js';
 import { globalJADXManager } from './jadx-manager.js';
 import { StaticAnalyzer } from './static-analyzer.js';
+import {
+  buildMarkdownReport,
+  buildSarifReport,
+  buildUnifiedSecurityReport,
+  type ReportFormat
+} from './security-report.js';
 import { createHash } from 'crypto';
-import { existsSync, statSync, readFileSync } from 'fs';
-import { basename } from 'path';
+import { existsSync, statSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
+import { basename, join, resolve } from 'path';
 import { spawnSync } from 'child_process';
 
 loadProjectEnv();
@@ -114,6 +120,29 @@ function printDependencyGuidance(results: DependencyCheckResult[]): void {
   } else {
     console.warn('[MCP] 已进入降级模式：缺失的推荐/可选能力对应工具会不可用。');
   }
+}
+
+function sanitizeReportName(value: string): string {
+  const normalized = value.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-+/g, '-');
+  return normalized.length > 0 ? normalized : `security-report-${Date.now()}`;
+}
+
+function parseReportFormats(input: unknown): ReportFormat[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+  const validSet = new Set<ReportFormat>(['json', 'md', 'sarif']);
+  const formats: ReportFormat[] = [];
+  for (const item of input) {
+    if (typeof item !== 'string') {
+      continue;
+    }
+    const normalized = item.toLowerCase() as ReportFormat;
+    if (validSet.has(normalized) && !formats.includes(normalized)) {
+      formats.push(normalized);
+    }
+  }
+  return formats;
 }
 
 const server = new Server(
@@ -890,13 +919,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'static_comprehensive_analysis',
-        description: '📊 [静态分析] 执行全面的静态安全分析，包括敏感信息、调试泄露、弱加密等',
+        description: '📊 [静态分析] 执行全面静态安全分析，并可导出统一审计报告（json/md/sarif）',
         inputSchema: {
           type: 'object',
           properties: {
             target_path: {
               type: 'string',
               description: '要扫描的文件或目录路径'
+            },
+            output_formats: {
+              type: 'array',
+              items: {
+                type: 'string',
+                enum: ['json', 'md', 'sarif']
+              },
+              description: '可选：导出报告格式列表，如 [\"json\", \"md\", \"sarif\"]'
+            },
+            output_dir: {
+              type: 'string',
+              description: '可选：报告输出目录（默认: 项目根目录/reports）'
+            },
+            report_name: {
+              type: 'string',
+              description: '可选：报告文件名前缀（不含扩展名）'
             }
           },
           required: ['target_path'],
@@ -1331,12 +1376,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { command, device_id } = args as { command: string; device_id?: string };
         
         const result = await adbManager.runShellCommand(command, device_id);
+        const stdoutText = typeof result.stdout === 'string' ? result.stdout : String(result.stdout ?? '');
+        const stderrText = typeof result.stderr === 'string' ? result.stderr : String(result.stderr ?? '');
+        const structured = {
+          command,
+          deviceId: device_id || null,
+          success: result.success,
+          exitCode: result.exitCode,
+          stdout: stdoutText,
+          stderr: stderrText
+        };
         
         return {
           content: [
             {
               type: 'text',
-              text: `🐚 Shell命令执行结果:\n命令: ${command}\n状态: ${result.success ? '成功' : '失败'}\n\n输出:\n${result.stdout}\n\n错误:\n${result.stderr}`,
+              text: `🐚 Shell命令执行结果（sh -c 包装执行）\n` +
+                    `命令: ${command}\n` +
+                    `状态: ${result.success ? '成功' : '失败'}\n` +
+                    `退出码: ${result.exitCode}\n\n` +
+                    `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
             },
           ],
         };
@@ -2302,7 +2361,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'static_comprehensive_analysis': {
-        const { target_path } = args as { target_path: string };
+        const {
+          target_path,
+          output_formats,
+          output_dir,
+          report_name
+        } = args as {
+          target_path: string;
+          output_formats?: unknown;
+          output_dir?: string;
+          report_name?: string;
+        };
 
         try {
           console.log(`[MCP] 开始全面静态安全分析: ${target_path}`);
@@ -2310,6 +2379,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const sessionId = `static-${Date.now()}`;
           const analyzer = new StaticAnalyzer(sessionId);
           const result = analyzer.performComprehensiveAnalysis(target_path);
+          const selectedFormats = parseReportFormats(output_formats);
+          if (Array.isArray(output_formats) && output_formats.length > 0 && selectedFormats.length === 0) {
+            throw new Error('output_formats 仅支持 json / md / sarif');
+          }
+          const unifiedReport = buildUnifiedSecurityReport(target_path, result);
+          const generatedReports: string[] = [];
+
+          if (selectedFormats.length > 0) {
+            const reportBaseDir = output_dir ? resolve(output_dir) : resolve(process.cwd(), 'reports');
+            mkdirSync(reportBaseDir, { recursive: true });
+
+            const baseName = sanitizeReportName(report_name || `${basename(target_path)}-${Date.now()}`);
+            for (const format of selectedFormats) {
+              const extension = format === 'sarif' ? 'sarif.json' : format;
+              const reportPath = join(reportBaseDir, `${baseName}.${extension}`);
+
+              if (format === 'json') {
+                writeFileSync(reportPath, `${JSON.stringify(unifiedReport, null, 2)}\n`, 'utf8');
+              } else if (format === 'md') {
+                writeFileSync(reportPath, `${buildMarkdownReport(unifiedReport)}\n`, 'utf8');
+              } else if (format === 'sarif') {
+                writeFileSync(reportPath, `${JSON.stringify(buildSarifReport(unifiedReport), null, 2)}\n`, 'utf8');
+              }
+
+              generatedReports.push(reportPath);
+            }
+          }
 
           let resultText = `📊 全面静态安全分析报告\n\n`;
           
@@ -2348,7 +2444,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const typeNames: Record<string, string> = {
               'hardcoded_secret': '🔑 硬编码敏感信息',
               'debug_leak': '🐛 调试信息泄露', 
-              'weak_crypto': '🔒 弱加密算法'
+              'weak_crypto': '🔒 弱加密算法',
+              'sensitive_data': '🧪 可离线恢复敏感数据链路'
             };
             resultText += `• ${typeNames[type] || type}: ${findings.length}个\n`;
           });
@@ -2384,7 +2481,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           resultText += `• 📝 建立代码安全审计流程\n`;
           resultText += `• 🔍 集成静态代码安全扫描到CI/CD\n`;
           resultText += `• 📚 加强开发人员安全意识培训\n`;
-          
+
+          resultText += `\n📐 统一报告模型字段:\n`;
+          resultText += `• severity / cwe / masvs / evidence / repro / impact / fix\n`;
+          resultText += `• schemaVersion: ${unifiedReport.schemaVersion}\n`;
+          resultText += `• generatedAt: ${unifiedReport.generatedAt}\n`;
+
+          if (selectedFormats.length > 0) {
+            resultText += `\n📦 已导出报告文件:\n`;
+            generatedReports.forEach(path => {
+              resultText += `• ${path}\n`;
+            });
+          } else {
+            resultText += `\n💡 可选导出: 传入 output_formats=[\"json\",\"md\",\"sarif\"] 直接生成审计报告文件\n`;
+          }
+
           resultText += `\n📄 报告生成时间: ${new Date().toISOString()}`;
 
           return {

@@ -1031,7 +1031,76 @@ export class ADBManager {
   // ===== Shell 命令 =====
 
   async runShellCommand(command: string, deviceId?: string): Promise<ShellCommandResult> {
-    return this.runADBCommand(`shell ${command}`, deviceId);
+    const targetDevice = deviceId || this.currentDeviceId;
+    const deviceArgs = targetDevice ? ['-s', targetDevice] : [];
+    const marker = `__MCP_EXIT_CODE_${Date.now()}_${Math.random().toString(36).slice(2, 8)}__`;
+    const wrappedCommand = `${command}\n__mcp_ec=$?\nprintf "\\n${marker}:%s\\n" "$__mcp_ec"\nexit "$__mcp_ec"`;
+    const adbArgs = [...deviceArgs, 'shell', 'sh', '-c', wrappedCommand];
+    const displayCommand = `${this.adbPath} ${deviceArgs.join(' ')} shell sh -c "<user_command>"`.trim();
+
+    console.log(`[ADB] Shell执行: ${displayCommand}`);
+
+    const execution = await new Promise<{ stdout: string; stderr: string; exitCode: number }>((resolve) => {
+      const child = spawn(this.adbPath, adbArgs, { shell: false });
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      child.on('error', (error: Error) => {
+        stderr += `${stderr ? '\n' : ''}${error.message}`;
+      });
+      child.on('close', (code) => {
+        resolve({
+          stdout,
+          stderr,
+          exitCode: typeof code === 'number' ? code : 1
+        });
+      });
+    });
+
+    let parsedExitCode = execution.exitCode;
+    let cleanedStdout = execution.stdout;
+    const markerRegex = new RegExp(`${this.escapeRegExp(marker)}:(-?\\d+)\\s*$`);
+    const markerMatch = cleanedStdout.match(markerRegex);
+    if (markerMatch) {
+      const markerCode = parseInt(markerMatch[1], 10);
+      if (!Number.isNaN(markerCode)) {
+        parsedExitCode = markerCode;
+      }
+      cleanedStdout = cleanedStdout.replace(markerRegex, '').replace(/\n+$/, '');
+    }
+
+    const normalizedStdout = cleanedStdout.trim();
+    const normalizedStderr = execution.stderr.trim();
+
+    globalLogger.addLog({
+      type: parsedExitCode === 0 ? 'info' : 'error',
+      sessionId: 'adb',
+      data: {
+        command: displayCommand,
+        userCommand: command,
+        deviceId: targetDevice,
+        exitCode: parsedExitCode,
+        stdout: normalizedStdout,
+        stderr: normalizedStderr
+      }
+    });
+
+    return {
+      success: parsedExitCode === 0,
+      stdout: normalizedStdout,
+      stderr: normalizedStderr,
+      exitCode: parsedExitCode
+    };
+  }
+
+  private escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   // ===== 输入模拟 =====

@@ -14,6 +14,7 @@
 - 首次运行可自动下载 JADX（默认 `v1.5.5`）
 - 支持 `.env`、Android SDK 路径、系统 PATH 多层回退
 - 内置健康检查链路：`check` + `smoke` + `verify`
+- 综合静态分析可直接导出统一审计报告（`json` / `md` / `sarif`）
 
 ## 📌 能力边界
 
@@ -127,7 +128,7 @@ npm run dev      # 构建后启动（同 start）
 - ADB 工具 `22`：设备、应用、文件、输入模拟、截屏录屏
 - AAPT 工具 `4`：badging、permissions、xmltree、完整分析
 - JADX 工具 `3`：反编译、输出信息、APK 验证
-- 静态分析工具 `4`：secrets/debug/weak-crypto/comprehensive
+- 静态分析工具 `4`：secrets/debug/weak-crypto/comprehensive（含统一报告导出）
 - 工作流工具 `6`：模板、上下文、智能建议、执行记录
 - 文件工具 `1`：`sha256` 指纹
 
@@ -139,7 +140,13 @@ npm run dev      # 构建后启动（同 start）
 分析这个 APK 的基础信息：/path/to/app.apk
 反编译这个 APK 并输出关键目录：/path/to/app.apk
 对当前连接设备截图并保存到默认目录
+对反编译目录做全面静态分析，并导出 json/md/sarif 报告到 /tmp/reports
 ```
+
+`static_comprehensive_analysis` 支持可选参数：
+- `output_formats`: `["json","md","sarif"]` 中的任意组合
+- `output_dir`: 报告输出目录（默认 `./reports`）
+- `report_name`: 报告文件名前缀
 
 ## 📚 Prompt 示例
 
