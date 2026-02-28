@@ -37,6 +37,24 @@ npm start
 
 就这三步，其他配置都可以后补。
 
+## 🔌 一键安装到客户端
+
+```bash
+# 同时安装到 Codex + Claude
+npm run install:mcp
+
+# 仅安装到 Codex
+npm run install:mcp:codex
+
+# 仅安装到 Claude
+npm run install:mcp:claude
+```
+
+安装脚本会：
+1. 自动定位客户端配置文件（`~/.codex/config.toml`、Claude Desktop 配置）
+2. 写入 `mobile-app-testing` MCP Server 条目（指向 `scripts/start.js`）
+3. 变更前自动备份原文件（`.bak.<timestamp>`）
+
 ## 🧭 `npm start` 会自动做什么
 
 `npm start` 实际执行 `node scripts/start.js`，启动前会自动：
@@ -165,6 +183,7 @@ npm run check
 - 确认 `args` 是绝对路径且指向 `scripts/start.js`
 - 确认 `cwd` 指向项目根目录
 - 先运行 `npm run verify` 排除服务端问题
+- 可重新执行 `npm run install:mcp` 覆盖更新客户端配置
 
 ### 5) 设备显示 `unauthorized`
 
