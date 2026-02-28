@@ -1,86 +1,30 @@
-# 登录验证逻辑Hook分析
+# 密码验证逻辑分析（静态 + ADB流程）
 
-目标：Hook并分析APP的密码验证机制
+## 说明
+当前工具集不提供Hook注入。本模板通过源码审计与界面流程验证分析密码校验实现。
 
-## 目标APP
-- **包名**：`com.banking.app`
-- **APK文件**：`/path/to/banking.apk`（二选一）
+## 输入
+- APK路径：`/path/to/app.apk`
+- 目标包名：`com.example.app`
 
-## Hook任务
+## 执行步骤
+1. `jadx_decompile_apk`：获取源码。
+2. `jadx_get_info`：定位登录模块与认证相关包。
+3. `static_scan_secrets`：检查硬编码测试账号、后门口令、固定Token。
+4. `static_scan_weak_crypto`：检查密码处理中的弱哈希/不安全加密。
+5. `static_scan_debug_leaks`：检查密码/Token日志泄露。
+6. `adb_start_app`：启动应用到登录页。
+7. `adb_screenshot`：记录登录前后页面状态。
+8. `adb_input_text` + `adb_tap`：执行错误凭据/边界输入测试。
+9. `adb_shell_command`：采集异常输出和系统反馈。
 
-### 1. 定位验证逻辑
-- 搜索登录相关Activity/Fragment
-- 找到密码验证方法（login、authenticate、verify等）
-- 分析验证参数和返回值
+## 检查清单
+- [ ] 是否存在客户端本地明文/弱哈希校验
+- [ ] 是否存在可被重放的静态凭据
+- [ ] 是否存在敏感日志泄露
+- [ ] 异常处理是否泄露内部实现细节
 
-### 2. Hook关键函数
-- Hook密码输入处理函数
-- Hook网络请求发送函数
-- Hook验证结果处理函数
-- Hook加密/哈希算法函数
-
-### 3. 数据提取
-- 捕获用户输入的明文密码
-- 拦截加密后的密码数据
-- 记录验证请求和响应
-- 分析验证失败的返回码
-
-### 4. 绕过尝试
-- 修改验证结果为成功
-- 跳过验证逻辑直接进入主界面
-- 测试万能密码或默认凭据
-
-## 脚本要求
-- 包含完整Frida JavaScript代码
-- 添加详细日志输出
-- 支持动态开关Hook功能
-- 包含错误处理机制
-
-## 验证步骤
-- 正常登录流程测试
-- 错误密码Hook测试  
-- 绕过验证成功确认
-
-## 执行检查清单
-- [ ] 使用 `adb_devices` 确认设备连接
-- [ ] 使用 `aapt_analyze_apk` 获取基本信息
-- [ ] 使用 `jadx_decompile_apk` 反编译源码
-- [ ] 搜索登录相关类：`Login`, `Auth`, `Verify`, `SignIn`
-- [ ] 使用 `frida_list_processes` 找到目标进程
-- [ ] 使用 `frida_attach_process` 连接进程
-- [ ] 使用 `frida_hook_method` Hook关键方法
-- [ ] 使用 `adb_screenshot` 记录登录界面
-- [ ] 使用 `frida_save_logs` 保存Hook日志
-
-## 常见Hook目标
-- **Android系统类**：
-  - `android.widget.EditText.getText()`
-  - `java.net.HttpURLConnection`
-  - `javax.crypto.Cipher`
-  
-- **常见验证方法**：
-  - `*.login()`, `*.authenticate()`, `*.verify()`
-  - `*.checkPassword()`, `*.validateUser()`
-  - `*.doLogin()`, `*.performLogin()`
-
-## 示例Hook代码结构
-```javascript
-Java.perform(function() {
-    // Hook密码输入
-    var EditText = Java.use("android.widget.EditText");
-    EditText.getText.implementation = function() {
-        var result = this.getText();
-        console.log("[+] 密码输入: " + result);
-        return result;
-    };
-    
-    // Hook验证方法
-    var LoginClass = Java.use("com.app.LoginActivity");
-    LoginClass.authenticate.implementation = function(username, password) {
-        console.log("[+] 验证尝试: " + username + " / " + password);
-        var result = this.authenticate(username, password);
-        console.log("[+] 验证结果: " + result);
-        return true; // 强制返回成功
-    };
-});
-```
+## 输出
+- 认证链路结构（输入→处理→校验→反馈）
+- 高风险问题及证据
+- 修复建议（服务端校验、强哈希、日志脱敏、错误处理收敛）

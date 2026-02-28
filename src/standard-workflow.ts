@@ -1,5 +1,5 @@
 // 标准移动安全测试工作流定义
-// 基于用户提供的专业测试流程
+// 聚焦 ADB 自动化、AAPT 分析、JADX 反编译与静态扫描
 
 export interface WorkflowPhase {
   id: string;
@@ -7,7 +7,7 @@ export interface WorkflowPhase {
   description: string;
   tools: string[];
   dependencies?: string[];
-  criticalPath: boolean; // 是否为关键路径
+  criticalPath: boolean;
 }
 
 export interface ToolExecutionRule {
@@ -21,231 +21,235 @@ export interface ToolExecutionRule {
 }
 
 export class StandardWorkflowEngine {
-  // 标准测试阶段定义
   private phases: Map<string, WorkflowPhase> = new Map([
     ['phase1_preparation', {
       id: 'phase1_preparation',
-      name: '阶段一：环境准备与状态确认',
-      description: '建立基础连接，确认测试目标和环境状态',
-      tools: ['frida_list_devices', 'adb_screenshot', 'adb_list_packages', 'adb_start_app'],
+      name: '阶段一：设备与目标确认',
+      description: '确认设备连接、应用存在与基础运行状态',
+      tools: ['adb_list_devices', 'adb_set_device', 'adb_list_packages', 'adb_start_app', 'adb_screenshot'],
       criticalPath: true
     }],
-    
-    ['phase2_connection', {
-      id: 'phase2_connection', 
-      name: '阶段二：调试连接建立',
-      description: '附加到目标进程，建立Frida调试会话',
-      tools: ['frida_attach', 'frida_connection_status', 'frida_inject_script', 'frida_realtime_logs'],
+
+    ['phase2_static_apk', {
+      id: 'phase2_static_apk',
+      name: '阶段二：APK静态信息分析',
+      description: '基于 AAPT 提取包信息、权限与清单结构',
+      tools: ['aapt_dump_badging', 'aapt_dump_permissions', 'aapt_dump_xmltree', 'aapt_analyze_apk'],
       dependencies: ['phase1_preparation'],
       criticalPath: true
     }],
-    
-    ['phase3_automation_loop', {
-      id: 'phase3_automation_loop',
-      name: '阶段三：界面分析与自动化操作',
-      description: '循环执行：截屏→UI分析→操作→验证',
-      tools: ['adb_screenshot', 'adb_shell_command', 'adb_pull_file', 'adb_tap', 'adb_input_text'],
-      dependencies: ['phase2_connection'],
+
+    ['phase3_reverse_engineering', {
+      id: 'phase3_reverse_engineering',
+      name: '阶段三：反编译与源码结构分析',
+      description: '使用 JADX 验证、反编译并统计项目结构',
+      tools: ['jadx_validate_apk', 'jadx_decompile_apk', 'jadx_get_info'],
+      dependencies: ['phase2_static_apk'],
       criticalPath: true
     }],
-    
-    ['phase4_monitoring', {
-      id: 'phase4_monitoring',
-      name: '阶段四：监控与数据收集',
-      description: '收集Hook数据，提取敏感信息',
-      tools: ['frida_realtime_logs', 'frida_memory_search', 'adb_pull_file', 'frida_save_logs'],
-      dependencies: ['phase3_automation_loop'],
+
+    ['phase4_security_review', {
+      id: 'phase4_security_review',
+      name: '阶段四：静态安全审查',
+      description: '执行敏感信息、调试泄露、弱加密与综合扫描',
+      tools: ['static_scan_secrets', 'static_scan_debug_leaks', 'static_scan_weak_crypto', 'static_comprehensive_analysis'],
+      dependencies: ['phase3_reverse_engineering'],
+      criticalPath: true
+    }],
+
+    ['phase5_evidence', {
+      id: 'phase5_evidence',
+      name: '阶段五：证据留存与补充取证',
+      description: '哈希固化、截图与必要文件拉取',
+      tools: ['file_sha256', 'adb_pull_file_advanced', 'adb_screenshot'],
+      dependencies: ['phase4_security_review'],
       criticalPath: false
-    }],
-    
-    ['phase5_recovery', {
-      id: 'phase5_recovery',
-      name: '阶段五：错误恢复与重连',
-      description: '处理连接断开和错误恢复',
-      tools: ['frida_force_reconnect', 'frida_inject_script', 'adb_screenshot'],
-      dependencies: [],
-      criticalPath: true
     }]
   ]);
 
-  // 工具执行规则 - 基于标准流程
   private executionRules: Map<string, ToolExecutionRule> = new Map([
-    // ===== 阶段一：环境准备 =====
-    ['frida_list_devices', {
-      toolName: 'frida_list_devices',
+    ['adb_list_devices', {
+      toolName: 'adb_list_devices',
       phase: 'phase1_preparation',
       order: 1,
       dependencies: [],
-      nextSuggestions: ['adb_screenshot', 'adb_list_devices'],
-      criticalNotes: ['确保设备连接正常', '如果没有USB设备，检查ADB连接']
+      nextSuggestions: ['adb_set_device', 'adb_list_packages'],
+      criticalNotes: ['确认设备状态为 device', '若无设备，先排查 USB 调试与驱动']
     }],
-    
-    ['adb_screenshot', {
-      toolName: 'adb_screenshot', 
+
+    ['adb_set_device', {
+      toolName: 'adb_set_device',
       phase: 'phase1_preparation',
       order: 2,
-      dependencies: ['frida_list_devices'],
-      nextSuggestions: ['adb_list_packages', 'adb_list_devices'],
-      criticalNotes: ['记录当前界面状态', '每次关键操作前后都应截屏']
+      dependencies: ['adb_list_devices'],
+      nextSuggestions: ['adb_list_packages'],
+      criticalNotes: ['多设备场景必须先指定当前设备']
     }],
-    
+
     ['adb_list_packages', {
       toolName: 'adb_list_packages',
-      phase: 'phase1_preparation', 
+      phase: 'phase1_preparation',
       order: 3,
-      dependencies: ['adb_screenshot'],
-      nextSuggestions: ['adb_start_app', 'frida_list_processes'],
-      criticalNotes: ['确认目标应用已安装', '记下完整的包名']
+      dependencies: ['adb_list_devices'],
+      nextSuggestions: ['adb_start_app', 'aapt_dump_badging'],
+      criticalNotes: ['确认目标包名，避免后续分析对象错误']
     }],
-    
+
     ['adb_start_app', {
       toolName: 'adb_start_app',
       phase: 'phase1_preparation',
       order: 4,
       dependencies: ['adb_list_packages'],
-      nextSuggestions: ['frida_list_processes', 'frida_attach'],
-      criticalNotes: ['启动目标应用', '等待应用完全加载后再进行下一步']
+      nextSuggestions: ['adb_screenshot', 'adb_shell_command'],
+      criticalNotes: ['启动后建议立即截图记录基线界面']
     }],
 
-    // ===== 阶段二：调试连接 =====
-    ['frida_attach', {
-      toolName: 'frida_attach',
-      phase: 'phase2_connection',
+    ['adb_screenshot', {
+      toolName: 'adb_screenshot',
+      phase: 'phase1_preparation',
       order: 5,
       dependencies: ['adb_start_app'],
-      nextSuggestions: ['frida_connection_status', 'frida_inject_script'],
-      criticalNotes: ['必须在脚本注入前执行', '确保目标应用正在运行'],
-      errorRecovery: ['检查frida-server是否运行', '确认应用进程存在', '尝试重新启动应用']
+      nextSuggestions: ['aapt_dump_badging', 'adb_shell_command'],
+      criticalNotes: ['关键操作前后均建议截图留证']
     }],
-    
-    ['frida_connection_status', {
-      toolName: 'frida_connection_status',
-      phase: 'phase2_connection', 
+
+    ['aapt_dump_badging', {
+      toolName: 'aapt_dump_badging',
+      phase: 'phase2_static_apk',
       order: 6,
-      dependencies: ['frida_attach'],
-      nextSuggestions: ['frida_inject_script', 'frida_enumerate_classes'],
-      criticalNotes: ['验证Frida连接状态', '确认会话稳定']
-    }],
-    
-    ['frida_inject_script', {
-      toolName: 'frida_inject_script',
-      phase: 'phase2_connection',
-      order: 7, 
-      dependencies: ['frida_attach', 'frida_connection_status'],
-      nextSuggestions: ['frida_realtime_logs', 'adb_screenshot'],
-      criticalNotes: ['必须在进程附加后执行', '脚本注入是监控的基础'],
-      errorRecovery: ['检查脚本语法', '确认Frida会话有效', '重新附加进程']
-    }],
-    
-    ['frida_realtime_logs', {
-      toolName: 'frida_realtime_logs',
-      phase: 'phase2_connection',
-      order: 8,
-      dependencies: ['frida_inject_script'],
-      nextSuggestions: ['adb_screenshot', 'adb_shell_command'],
-      criticalNotes: ['启动实时日志监听', '为后续操作监控做准备']
-    }],
-
-    // ===== 阶段三：自动化操作循环 =====
-    // 注意：这个阶段是循环执行的
-    ['adb_shell_command', {
-      toolName: 'adb_shell_command',
-      phase: 'phase3_automation_loop',
-      order: 10,
-      dependencies: ['adb_screenshot'],
-      nextSuggestions: ['adb_pull_file'],
-      criticalNotes: ['执行uiautomator dump获取UI布局', '必须在UI操作分析前执行']
-    }],
-    
-    ['adb_pull_file', {
-      toolName: 'adb_pull_file', 
-      phase: 'phase3_automation_loop',
-      order: 11,
-      dependencies: ['adb_shell_command'],
-      nextSuggestions: ['adb_tap', 'adb_input_text'],
-      criticalNotes: ['拉取UI布局文件到本地分析', '为确定操作坐标做准备']
-    }],
-    
-    ['adb_tap', {
-      toolName: 'adb_tap',
-      phase: 'phase3_automation_loop', 
-      order: 13,
-      dependencies: ['adb_pull_file'],
-      nextSuggestions: ['adb_screenshot'],
-      criticalNotes: ['执行点击操作', '操作后必须立即截屏验证结果'],
-      errorRecovery: ['重新截屏确认界面状态', '重新获取UI布局', '调整点击坐标']
-    }],
-    
-    ['adb_input_text', {
-      toolName: 'adb_input_text',
-      phase: 'phase3_automation_loop',
-      order: 13,
-      dependencies: ['adb_pull_file'], 
-      nextSuggestions: ['adb_screenshot'],
-      criticalNotes: ['输入文本内容', '输入后必须立即截屏验证'],
-      errorRecovery: ['确认输入框已选中', '检查输入法状态', '重新截屏验证']
-    }],
-
-    // ===== 阶段四：监控数据收集 =====
-    ['frida_realtime_logs', {
-      toolName: 'frida_realtime_logs',
-      phase: 'phase4_monitoring',
-      order: 16,
-      dependencies: ['frida_realtime_logs'],
-      nextSuggestions: ['frida_memory_search', 'frida_save_logs'],
-      criticalNotes: ['检查Hook捕获的数据', '分析敏感信息泄露']
-    }],
-    
-    ['frida_memory_search', {
-      toolName: 'frida_memory_search',
-      phase: 'phase4_monitoring',
-      order: 17, 
-      dependencies: ['frida_inject_script'],
-      nextSuggestions: ['adb_pull_file', 'frida_save_logs'],
-      criticalNotes: ['搜索内存中的敏感数据', '查找密钥、密码等信息']
-    }],
-    
-    ['frida_save_logs', {
-      toolName: 'frida_save_logs',
-      phase: 'phase4_monitoring',
-      order: 19,
-      dependencies: ['frida_realtime_logs'],
-      nextSuggestions: [],
-      criticalNotes: ['保存监控日志到文件', '为后续分析保留证据']
-    }],
-
-    // ===== 阶段五：错误恢复 =====  
-    ['frida_force_reconnect', {
-      toolName: 'frida_force_reconnect',
-      phase: 'phase5_recovery',
-      order: 20,
       dependencies: [],
-      nextSuggestions: ['frida_inject_script', 'adb_screenshot'],
-      criticalNotes: ['连接断开时强制重连', '必须重新注入脚本'],
-      errorRecovery: ['检查frida-server状态', '重新启动应用', '重新附加进程']
+      nextSuggestions: ['aapt_dump_permissions', 'aapt_dump_xmltree'],
+      criticalNotes: ['优先确认包名、版本、SDK 与可调试状态']
+    }],
+
+    ['aapt_dump_permissions', {
+      toolName: 'aapt_dump_permissions',
+      phase: 'phase2_static_apk',
+      order: 7,
+      dependencies: ['aapt_dump_badging'],
+      nextSuggestions: ['aapt_analyze_apk', 'jadx_validate_apk'],
+      criticalNotes: ['优先关注高风险权限与权限组合']
+    }],
+
+    ['aapt_dump_xmltree', {
+      toolName: 'aapt_dump_xmltree',
+      phase: 'phase2_static_apk',
+      order: 8,
+      dependencies: ['aapt_dump_badging'],
+      nextSuggestions: ['aapt_analyze_apk'],
+      criticalNotes: ['重点检查 exported 组件和 intent-filter']
+    }],
+
+    ['aapt_analyze_apk', {
+      toolName: 'aapt_analyze_apk',
+      phase: 'phase2_static_apk',
+      order: 9,
+      dependencies: ['aapt_dump_permissions'],
+      nextSuggestions: ['jadx_validate_apk', 'jadx_decompile_apk'],
+      criticalNotes: ['用于快速形成静态风险初判']
+    }],
+
+    ['jadx_validate_apk', {
+      toolName: 'jadx_validate_apk',
+      phase: 'phase3_reverse_engineering',
+      order: 10,
+      dependencies: [],
+      nextSuggestions: ['jadx_decompile_apk'],
+      criticalNotes: ['反编译前建议先验证 APK 有效性']
+    }],
+
+    ['jadx_decompile_apk', {
+      toolName: 'jadx_decompile_apk',
+      phase: 'phase3_reverse_engineering',
+      order: 11,
+      dependencies: ['jadx_validate_apk'],
+      nextSuggestions: ['jadx_get_info', 'static_comprehensive_analysis'],
+      criticalNotes: ['反编译输出目录应固定，便于复现与对比'],
+      errorRecovery: ['检查 APK 完整性', '调整 threads_count', '确认 JADX 可执行路径']
+    }],
+
+    ['jadx_get_info', {
+      toolName: 'jadx_get_info',
+      phase: 'phase3_reverse_engineering',
+      order: 12,
+      dependencies: ['jadx_decompile_apk'],
+      nextSuggestions: ['static_scan_secrets', 'static_scan_weak_crypto'],
+      criticalNotes: ['先看目录结构，再做有目标的静态扫描']
+    }],
+
+    ['static_scan_secrets', {
+      toolName: 'static_scan_secrets',
+      phase: 'phase4_security_review',
+      order: 13,
+      dependencies: ['jadx_decompile_apk'],
+      nextSuggestions: ['static_scan_debug_leaks', 'static_scan_weak_crypto'],
+      criticalNotes: ['优先检查 token/key/credential 类命中']
+    }],
+
+    ['static_scan_debug_leaks', {
+      toolName: 'static_scan_debug_leaks',
+      phase: 'phase4_security_review',
+      order: 14,
+      dependencies: ['jadx_decompile_apk'],
+      nextSuggestions: ['static_scan_weak_crypto', 'static_comprehensive_analysis'],
+      criticalNotes: ['重点关注日志输出中的敏感字段']
+    }],
+
+    ['static_scan_weak_crypto', {
+      toolName: 'static_scan_weak_crypto',
+      phase: 'phase4_security_review',
+      order: 15,
+      dependencies: ['jadx_decompile_apk'],
+      nextSuggestions: ['static_comprehensive_analysis'],
+      criticalNotes: ['重点关注 MD5/DES/ECB/固定 IV 等模式']
+    }],
+
+    ['static_comprehensive_analysis', {
+      toolName: 'static_comprehensive_analysis',
+      phase: 'phase4_security_review',
+      order: 16,
+      dependencies: ['jadx_decompile_apk'],
+      nextSuggestions: ['file_sha256', 'adb_pull_file_advanced'],
+      criticalNotes: ['用于输出整体风险视角，建议作为收尾步骤']
+    }],
+
+    ['file_sha256', {
+      toolName: 'file_sha256',
+      phase: 'phase5_evidence',
+      order: 17,
+      dependencies: [],
+      nextSuggestions: ['adb_pull_file_advanced', 'adb_screenshot'],
+      criticalNotes: ['对关键样本与输出文件做哈希固化']
+    }],
+
+    ['adb_pull_file_advanced', {
+      toolName: 'adb_pull_file_advanced',
+      phase: 'phase5_evidence',
+      order: 18,
+      dependencies: ['adb_list_devices'],
+      nextSuggestions: ['file_sha256'],
+      criticalNotes: ['拉取后建议立即计算 SHA256 记录证据链']
     }]
   ]);
 
-  // 获取当前阶段
   getCurrentPhase(executedTools: string[]): string {
-    // 根据已执行的工具判断当前阶段
-    if (executedTools.includes('frida_save_logs') || executedTools.includes('frida_memory_search')) {
-      return 'phase4_monitoring';
+    if (executedTools.includes('static_comprehensive_analysis') ||
+        executedTools.includes('static_scan_weak_crypto') ||
+        executedTools.includes('static_scan_secrets')) {
+      return 'phase4_security_review';
     }
-    if (executedTools.includes('adb_tap') || executedTools.includes('adb_input_text')) {
-      return 'phase3_automation_loop';  
+
+    if (executedTools.includes('jadx_decompile_apk') || executedTools.includes('jadx_get_info')) {
+      return 'phase3_reverse_engineering';
     }
-    if (executedTools.includes('frida_inject_script') || executedTools.includes('frida_realtime_logs')) {
-      return 'phase2_connection';
+
+    if (executedTools.includes('aapt_dump_badging') || executedTools.includes('aapt_analyze_apk')) {
+      return 'phase2_static_apk';
     }
-    if (executedTools.includes('adb_screenshot') || executedTools.includes('adb_list_packages')) {
-      return 'phase1_preparation';
-    }
-    
-    return 'phase1_preparation'; // 默认从第一阶段开始
+
+    return 'phase1_preparation';
   }
 
-  // 获取下一个建议工具（基于标准流程）
   getNextToolSuggestions(executedTools: string[], lastTool?: string): {
     tool: string;
     reason: string;
@@ -254,53 +258,63 @@ export class StandardWorkflowEngine {
     criticalNotes: string[];
   }[] {
     const currentPhase = this.getCurrentPhase(executedTools);
-    const suggestions: any[] = [];
+    const suggestions: Array<{ tool: string; reason: string; phase: string; order: number; criticalNotes: string[] }> = [];
 
-    // 特殊处理：如果最后一个工具有特定的下一步建议
     if (lastTool && this.executionRules.has(lastTool)) {
       const rule = this.executionRules.get(lastTool)!;
       for (const nextTool of rule.nextSuggestions) {
-        if (!executedTools.includes(nextTool)) {
-          const nextRule = this.executionRules.get(nextTool);
-          if (nextRule) {
-            suggestions.push({
-              tool: nextTool,
-              reason: `根据标准流程，${lastTool}后应执行此工具`,
-              phase: nextRule.phase,
-              order: nextRule.order,
-              criticalNotes: nextRule.criticalNotes || []
-            });
-          }
+        if (executedTools.includes(nextTool)) {
+          continue;
         }
+        const nextRule = this.executionRules.get(nextTool);
+        if (!nextRule) {
+          continue;
+        }
+
+        const dependenciesMet = nextRule.dependencies.every(dep => executedTools.includes(dep));
+        if (!dependenciesMet) {
+          continue;
+        }
+
+        suggestions.push({
+          tool: nextTool,
+          reason: `根据标准流程，${lastTool}后建议执行该工具`,
+          phase: nextRule.phase,
+          order: nextRule.order,
+          criticalNotes: nextRule.criticalNotes || []
+        });
       }
     }
 
-    // 如果没有特定建议，按阶段推荐
     if (suggestions.length === 0) {
       const phaseTools = Array.from(this.executionRules.values())
         .filter(rule => rule.phase === currentPhase)
         .filter(rule => !executedTools.includes(rule.toolName))
         .sort((a, b) => a.order - b.order);
 
-      for (const rule of phaseTools.slice(0, 3)) {
-        // 检查依赖是否满足
+      for (const rule of phaseTools) {
         const dependenciesMet = rule.dependencies.every(dep => executedTools.includes(dep));
-        if (dependenciesMet) {
-          suggestions.push({
-            tool: rule.toolName,
-            reason: `${this.phases.get(currentPhase)?.name}的下一步标准操作`,
-            phase: rule.phase,
-            order: rule.order,
-            criticalNotes: rule.criticalNotes || []
-          });
+        if (!dependenciesMet) {
+          continue;
+        }
+
+        suggestions.push({
+          tool: rule.toolName,
+          reason: `${this.phases.get(currentPhase)?.name}的下一步标准操作`,
+          phase: rule.phase,
+          order: rule.order,
+          criticalNotes: rule.criticalNotes || []
+        });
+
+        if (suggestions.length >= 3) {
+          break;
         }
       }
     }
 
-    return suggestions.slice(0, 3); // 最多返回3个建议
+    return suggestions.slice(0, 3);
   }
 
-  // 获取工具的执行建议
   getToolExecutionAdvice(toolName: string): {
     phase: string;
     dependencies: string[];
@@ -308,7 +322,9 @@ export class StandardWorkflowEngine {
     errorRecovery: string[];
   } | null {
     const rule = this.executionRules.get(toolName);
-    if (!rule) return null;
+    if (!rule) {
+      return null;
+    }
 
     return {
       phase: this.phases.get(rule.phase)?.name || rule.phase,
@@ -318,7 +334,6 @@ export class StandardWorkflowEngine {
     };
   }
 
-  // 验证工具执行顺序
   validateToolOrder(toolName: string, executedTools: string[]): {
     valid: boolean;
     missingDependencies: string[];
@@ -332,19 +347,17 @@ export class StandardWorkflowEngine {
     const missingDependencies = rule.dependencies.filter(dep => !executedTools.includes(dep));
     const warnings: string[] = [];
 
-    // 检查关键路径违规
     if (missingDependencies.length > 0) {
       warnings.push(`缺少前置工具: ${missingDependencies.join(', ')}`);
       warnings.push(`建议先执行: ${missingDependencies[0]}`);
     }
 
-    // 特殊规则检查
-    if (toolName === 'frida_inject_script' && !executedTools.includes('frida_attach')) {
-      warnings.push('⚠️ 必须先附加进程再注入脚本');
-    }
-    
     if (toolName === 'adb_tap' && !executedTools.includes('adb_screenshot')) {
-      warnings.push('⚠️ 建议操作前先截屏记录界面状态');
+      warnings.push('⚠️ 建议点击前先截屏记录界面状态');
+    }
+
+    if (toolName === 'jadx_decompile_apk' && !executedTools.includes('jadx_validate_apk')) {
+      warnings.push('⚠️ 建议反编译前先执行 jadx_validate_apk');
     }
 
     return {
@@ -354,12 +367,10 @@ export class StandardWorkflowEngine {
     };
   }
 
-  // 获取阶段信息
   getPhaseInfo(phaseId: string): WorkflowPhase | null {
     return this.phases.get(phaseId) || null;
   }
 
-  // 获取所有阶段
   getAllPhases(): WorkflowPhase[] {
     return Array.from(this.phases.values());
   }

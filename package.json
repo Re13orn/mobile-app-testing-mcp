@@ -5,16 +5,18 @@
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.js",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js",
+    "dev": "npm run build && node dist/index.js",
     "test": "node --test dist/test/*.js",
-    "setup": "chmod +x scripts/setup.sh && scripts/setup.sh",
-    "check": "node scripts/check-env.js"
+    "setup": "node scripts/setup.js",
+    "setup:legacy": "chmod +x scripts/setup.sh && scripts/setup.sh",
+    "check": "node scripts/check-env.js",
+    "smoke": "node scripts/smoke-mcp.js",
+    "verify": "npm run build && npm run check && npm run smoke"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "frida": "^16.1.0"
+    "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -23,7 +25,17 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["mobile-testing", "app-security", "mcp", "frida", "adb", "android", "ios", "automation", "security-testing"],
+  "keywords": [
+    "mobile-testing",
+    "app-security",
+    "mcp",
+    "adb",
+    "aapt",
+    "jadx",
+    "android",
+    "automation",
+    "security-testing"
+  ],
   "author": "",
   "license": "MIT"
 }

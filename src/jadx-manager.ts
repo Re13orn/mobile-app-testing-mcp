@@ -3,9 +3,10 @@
 
 import { execSync, exec } from 'child_process';
 import { promisify } from 'util';
-import { existsSync, statSync, mkdirSync, readdirSync } from 'fs';
+import { existsSync, statSync, mkdirSync, readdirSync, rmSync } from 'fs';
 import { join, dirname, basename, extname } from 'path';
 import { globalLogger } from './logger.js';
+import { getEnvValue, getProjectRoot, loadProjectEnv } from './env-utils.js';
 
 const execAsync = promisify(exec);
 
@@ -52,14 +53,18 @@ export class JADXManager {
   private defaultOutputDir: string;
   
   constructor() {
-    this.defaultOutputDir = join(process.cwd(), 'decompiled');
+    loadProjectEnv();
+    this.defaultOutputDir = getEnvValue('DECOMPILED_DIR') || join(getProjectRoot(), 'decompiled');
     this.detectJADXPath();
   }
 
   private detectJADXPath(): void {
     const possiblePaths = [
+      // 显式配置优先
+      getEnvValue('JADX_PATH'),
       // 项目本地JADX
-      join(process.cwd(), 'jadx', 'bin', 'jadx'),
+      join(getProjectRoot(), 'jadx', 'bin', 'jadx'),
+      join(getProjectRoot(), 'jadx', 'bin', 'jadx.bat'),
       // 系统PATH中的jadx
       'jadx',
       // 常见安装路径
@@ -68,10 +73,16 @@ export class JADXManager {
       // Homebrew安装路径 (macOS)
       '/opt/homebrew/bin/jadx',
       // 用户本地安装
-      join(process.env.HOME || '', 'jadx', 'bin', 'jadx')
+      join(process.env.HOME || '', 'jadx', 'bin', 'jadx'),
+      // Windows 常见路径
+      process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'jadx', 'bin', 'jadx.bat') : '',
+      process.env.ProgramFiles ? join(process.env.ProgramFiles, 'jadx', 'bin', 'jadx.bat') : ''
     ];
 
     for (const path of possiblePaths) {
+      if (!path) {
+        continue;
+      }
       try {
         if (existsSync(path) && statSync(path).isFile()) {
           // 测试jadx命令是否可执行
@@ -385,8 +396,7 @@ export class JADXManager {
     }
 
     try {
-      const { execSync } = await import('child_process');
-      execSync(`rm -rf "${outputDir}"`);
+      rmSync(outputDir, { recursive: true, force: true });
       console.log(`[JADX] 已清理输出目录: ${outputDir}`);
     } catch (error) {
       console.warn(`[JADX] 清理输出目录失败: ${error}`);

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mobile-app-testing": {
+      "command": "node",
+      "args": ["/path/to/your/project/dist/index.js"],
+      "cwd": "/path/to/your/project",
+      "env": {
+        "ANDROID_HOME": "/path/to/android/sdk"
+      }
+    }
+  }
+}

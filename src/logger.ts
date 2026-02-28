@@ -1,6 +1,7 @@
 import { writeFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { EventEmitter } from 'events';
+import { getEnvValue, getProjectRoot, loadProjectEnv } from './env-utils.js';
 
 export interface LogEntry {
   timestamp: number;
@@ -26,9 +27,9 @@ export class Logger extends EventEmitter {
   private ensureInitialized(): void {
     if (!this.initialized) {
       try {
-        // 使用项目根目录而不是当前工作目录
-        const projectRoot = process.cwd();
-        this.logDir = join(projectRoot, 'logs');
+        loadProjectEnv();
+        const projectRoot = getProjectRoot();
+        this.logDir = getEnvValue('LOGS_DIR') || join(projectRoot, 'logs');
         
         console.log(`[Logger] 初始化日志目录: ${this.logDir}`);
         

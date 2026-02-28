@@ -4,6 +4,7 @@ import { writeFileSync, existsSync, mkdirSync, unlinkSync, statSync, readFileSyn
 import { join, dirname, basename } from 'path';
 import { homedir, tmpdir } from 'os';
 import { globalLogger } from './logger.js';
+import { getProjectRoot, getEnvValue, loadProjectEnv } from './env-utils.js';
 
 const execAsync = promisify(exec);
 
@@ -74,54 +75,60 @@ export class ADBManager {
   private screenshotDir: string;
   private recordingDir: string;
 
-  constructor(adbPath: string = 'adb') {
-    this.adbPath = adbPath;
-    this.screenshotDir = join(process.cwd(), 'screenshots');
-    this.recordingDir = join(process.cwd(), 'recordings');
+  constructor(adbPath?: string) {
+    loadProjectEnv();
+    const projectRoot = getProjectRoot();
+
+    this.adbPath = adbPath || getEnvValue('ADB_PATH') || 'adb';
+    this.screenshotDir = getEnvValue('SCREENSHOTS_DIR') || join(projectRoot, 'screenshots');
+    this.recordingDir = getEnvValue('RECORDINGS_DIR') || join(projectRoot, 'recordings');
     
     // 确保目录存在
     this.ensureDirectories();
   }
 
   private ensureDirectories(): string {
-    const fallbackPaths = [
-      this.screenshotDir,  // 默认项目目录 - screenshots
-      join(homedir(), 'mobile-app-testing-screenshots'),  // 用户目录
-      join(tmpdir(), 'mobile-app-testing-screenshots')   // 临时目录
+    const fallbackDirs = [
+      { screenshotDir: this.screenshotDir, recordingDir: this.recordingDir },
+      {
+        screenshotDir: join(homedir(), 'mobile-app-testing-screenshots'),
+        recordingDir: join(homedir(), 'mobile-app-testing-recordings')
+      },
+      {
+        screenshotDir: join(tmpdir(), 'mobile-app-testing-screenshots'),
+        recordingDir: join(tmpdir(), 'mobile-app-testing-recordings')
+      }
     ];
 
-    for (let i = 0; i < fallbackPaths.length; i++) {
-      const dirPath = fallbackPaths[i];
+    for (let i = 0; i < fallbackDirs.length; i++) {
+      const { screenshotDir, recordingDir } = fallbackDirs[i];
       try {
-        console.log(`[ADB] 尝试目录 ${i + 1}/${fallbackPaths.length}: ${dirPath}`);
+        console.log(`[ADB] 尝试目录 ${i + 1}/${fallbackDirs.length}: ${screenshotDir}`);
         
-        // 确保目录存在
-        if (!existsSync(dirPath)) {
-          mkdirSync(dirPath, { recursive: true });
-          console.log(`[ADB] 成功创建目录: ${dirPath}`);
+        if (!existsSync(screenshotDir)) {
+          mkdirSync(screenshotDir, { recursive: true });
+          console.log(`[ADB] 成功创建目录: ${screenshotDir}`);
+        }
+        if (!existsSync(recordingDir)) {
+          mkdirSync(recordingDir, { recursive: true });
         }
         
         // 验证目录可写性
-        const testFile = join(dirPath, `.test_write_${Date.now()}`);
+        const testFile = join(screenshotDir, `.test_write_${Date.now()}`);
         writeFileSync(testFile, 'test screenshot permission');
         
         if (existsSync(testFile)) {
           unlinkSync(testFile);
-          console.log(`[ADB] ✅ 目录验证成功: ${dirPath}`);
+          console.log(`[ADB] ✅ 目录验证成功: ${screenshotDir}`);
           
           // 更新实例属性
-          this.screenshotDir = dirPath;
-          this.recordingDir = dirPath.replace('screenshots', 'recordings');
+          this.screenshotDir = screenshotDir;
+          this.recordingDir = recordingDir;
           
-          // 确保录屏目录也存在
-          if (!existsSync(this.recordingDir)) {
-            mkdirSync(this.recordingDir, { recursive: true });
-          }
-          
-          return dirPath;  // 返回成功的路径
+          return screenshotDir;  // 返回成功的路径
         }
       } catch (error) {
-        console.warn(`[ADB] ❌ 目录 ${dirPath} 不可用: ${error}`);
+        console.warn(`[ADB] ❌ 目录 ${screenshotDir} 不可用: ${error}`);
         continue;  // 尝试下一个路径
       }
     }
@@ -239,7 +246,7 @@ export class ADBManager {
         // 对于连接的设备，尝试获取更多信息
         if (device.state === 'device') {
           try {
-            const propResult = await this.runADBCommand(`-s ${device.id} shell getprop ro.product.model`, device.id);
+            const propResult = await this.runADBCommand('shell getprop ro.product.model', device.id);
             if (propResult.success && propResult.stdout.trim()) {
               device.model = device.model || propResult.stdout.trim();
             }
@@ -397,14 +404,16 @@ export class ADBManager {
   // ===== 进程管理 =====
 
   async findProcess(packageName: string, deviceId?: string): Promise<ProcessInfo[]> {
-    const result = await this.runADBCommand(`shell ps | grep ${packageName}`, deviceId);
+    const result = await this.runADBCommand('shell ps', deviceId);
     
     if (!result.success || !result.stdout) {
       return [];
     }
 
     const processes: ProcessInfo[] = [];
-    const lines = (result.stdout as string).split('\n').filter((line: string) => line.trim());
+    const lines = (result.stdout as string)
+      .split('\n')
+      .filter((line: string) => line.trim() && line.includes(packageName));
 
     for (const line of lines) {
       const parts = line.trim().split(/\s+/);
@@ -449,12 +458,19 @@ export class ADBManager {
       }
 
       // 方法2: 通过pm dump获取Activity信息
-      const pmResult = await this.runADBCommand(`shell pm dump ${packageName} | grep -A 5 "android.intent.action.MAIN"`, deviceId);
+      const pmResult = await this.runADBCommand(`shell pm dump ${packageName}`, deviceId);
       if (pmResult.success && pmResult.stdout) {
-        const activityMatch = pmResult.stdout.match(/([a-zA-Z0-9_.]+Activity[a-zA-Z0-9_]*)/);
-        if (activityMatch) {
-          console.log(`[ADB] 通过pm dump找到主Activity: ${activityMatch[1]}`);
-          return activityMatch[1];
+        const lines = pmResult.stdout.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (!lines[i].includes('android.intent.action.MAIN')) {
+            continue;
+          }
+          const nearby = lines.slice(i, i + 8).join('\n');
+          const activityMatch = nearby.match(/([a-zA-Z0-9_.]+Activity[a-zA-Z0-9_]*)/);
+          if (activityMatch) {
+            console.log(`[ADB] 通过pm dump找到主Activity: ${activityMatch[1]}`);
+            return activityMatch[1];
+          }
         }
       }
 
@@ -782,7 +798,10 @@ export class ADBManager {
   async stopScreenRecord(devicePath: string, localPath: string, deviceId?: string): Promise<ScreenRecordResult> {
     try {
       // 通过杀死screenrecord进程来停止录屏
-      await this.runADBCommand(`shell pkill screenrecord`, deviceId);
+      const stopResult = await this.runADBCommand('shell pkill screenrecord', deviceId);
+      if (!stopResult.success) {
+        await this.runADBCommand('shell killall screenrecord', deviceId);
+      }
       
       // 等待一点时间让文件写入完成
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -867,14 +886,7 @@ export class ADBManager {
           actualRemotePath = tempPath;
           tempRequired = true;
         } else {
-          // 尝试使用cat命令复制
-          const catResult = await this.runADBCommand(`shell cat "${remotePath}" > "${tempPath}"`, deviceId);
-          if (catResult.success) {
-            actualRemotePath = tempPath;
-            tempRequired = true;
-          } else {
-            console.warn(`[ADB] 无法访问受保护文件: ${remotePath}`);
-          }
+          console.warn(`[ADB] 无法访问受保护文件: ${remotePath}`);
         }
       }
 

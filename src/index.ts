@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { getEnvValue, loadProjectEnv } from './env-utils.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -8,25 +9,112 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
-import { FridaManager } from './frida-manager.js';
-import { SecurityManager } from './security.js';
 import { globalADBManager } from './adb-manager.js';
 import { globalWorkflowManager } from './workflow-manager.js';
-import { globalGadgetManager } from './gadget-manager.js';
 import { globalAAPTManager } from './aapt-manager.js';
 import { globalJADXManager } from './jadx-manager.js';
 import { StaticAnalyzer } from './static-analyzer.js';
 import { createHash } from 'crypto';
 import { existsSync, statSync, readFileSync } from 'fs';
 import { basename } from 'path';
+import { spawnSync } from 'child_process';
 
-const fridaManager = new FridaManager();
-const securityManager = new SecurityManager();
+loadProjectEnv();
+
 const adbManager = globalADBManager;
 const workflowManager = globalWorkflowManager;
 const aaptManager = globalAAPTManager;
 const jadxManager = globalJADXManager;
-const gadgetManager = globalGadgetManager;
+
+type DependencyCheckResult = {
+  name: 'adb' | 'aapt' | 'jadx';
+  level: 'required' | 'recommended' | 'optional';
+  ok: boolean;
+  detail: string;
+};
+
+function runVersionCommand(command: string, args: string[]): { ok: boolean; output: string } {
+  try {
+    const result = spawnSync(command, args, { encoding: 'utf8', stdio: 'pipe', shell: false });
+    if (result.status === 0) {
+      const output = `${result.stdout || ''}\n${result.stderr || ''}`.trim();
+      return { ok: true, output };
+    }
+    return { ok: false, output: `${result.stderr || result.stdout || ''}`.trim() };
+  } catch (error: any) {
+    return { ok: false, output: error?.message || 'unknown error' };
+  }
+}
+
+async function checkRuntimeDependencies(): Promise<DependencyCheckResult[]> {
+  const adbCommand = getEnvValue('ADB_PATH') || 'adb';
+  const adbResult = runVersionCommand(adbCommand, ['version']);
+
+  const aaptAvailable = await aaptManager.isAvailable();
+  const aaptVersion = aaptAvailable ? await aaptManager.getVersion() : null;
+  const aaptFallbackHint = getEnvValue('AAPT_PATH') || 'aapt / ANDROID_HOME(build-tools)';
+
+  const jadxAvailable = await jadxManager.isAvailable();
+  const jadxVersion = jadxAvailable ? await jadxManager.getVersion() : null;
+  const jadxFallbackHint = getEnvValue('JADX_PATH') || 'jadx';
+
+  const adbDetail = adbResult.ok
+    ? (adbResult.output.split('\n')[0] || adbCommand)
+    : `未找到命令: ${adbCommand}`;
+  const aaptDetail = aaptAvailable
+    ? (aaptVersion?.split('\n')[0] || '已检测到可用 AAPT')
+    : `未找到命令: ${aaptFallbackHint}`;
+  const jadxDetail = jadxAvailable
+    ? (jadxVersion?.split('\n')[0] || '已检测到可用 JADX')
+    : `未找到命令: ${jadxFallbackHint}`;
+
+  return [
+    { name: 'adb', level: 'required', ok: adbResult.ok, detail: adbDetail },
+    { name: 'aapt', level: 'recommended', ok: aaptAvailable, detail: aaptDetail },
+    { name: 'jadx', level: 'optional', ok: jadxAvailable, detail: jadxDetail }
+  ];
+}
+
+function printDependencyGuidance(results: DependencyCheckResult[]): void {
+  const requiredMissing = results.filter(item => item.level === 'required' && !item.ok);
+  const anyMissing = results.filter(item => !item.ok);
+
+  console.log('\n[MCP] 运行环境检查:');
+  for (const item of results) {
+    const levelTag = item.level === 'required' ? '必需' : item.level === 'recommended' ? '推荐' : '可选';
+    const statusTag = item.ok ? '✅' : item.level === 'required' ? '❌' : '⚠️';
+    console.log(`  ${statusTag} ${item.name} (${levelTag}) - ${item.detail}`);
+  }
+
+  if (anyMissing.length === 0) {
+    console.log('[MCP] 依赖检查通过，已启用完整能力。');
+    return;
+  }
+
+  console.log('\n[MCP] 依赖缺失配置指引:');
+  if (anyMissing.some(item => item.name === 'adb')) {
+    console.log('  1. 安装 Android SDK Platform Tools（提供 adb）');
+    console.log('  2. 配置 ADB_PATH，或将 $ANDROID_HOME/platform-tools 加入 PATH');
+  }
+  if (anyMissing.some(item => item.name === 'aapt')) {
+    console.log('  3. 安装 Android SDK Build Tools（提供 aapt）');
+    console.log('  4. 配置 AAPT_PATH，或设置 ANDROID_HOME/ANDROID_SDK_ROOT');
+  }
+  if (anyMissing.some(item => item.name === 'jadx')) {
+    console.log('  5. 安装 JADX（可选，缺失会影响反编译工具）');
+    console.log('     macOS: brew install jadx');
+    console.log('  6. 配置 JADX_PATH，或将 jadx 加入 PATH');
+  }
+  console.log('  7. 在项目根目录执行: npm run check');
+  console.log('  8. 全链路验证: npm run verify');
+  console.log('  9. 可在 .env 中配置: ANDROID_HOME / ADB_PATH / AAPT_PATH / JADX_PATH');
+
+  if (requiredMissing.length > 0) {
+    console.warn('[MCP] 检测到必需依赖缺失：ADB 相关工具调用会失败，需先完成上面配置。');
+  } else {
+    console.warn('[MCP] 已进入降级模式：缺失的推荐/可选能力对应工具会不可用。');
+  }
+}
 
 const server = new Server(
   {
@@ -43,349 +131,6 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
-      {
-        name: 'frida_attach',
-        description: '🔗 [阶段二/调试连接] 附加到指定移动应用进程进行动态分析',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            target: {
-              type: 'string',
-              description: '目标应用包名、PID或进程名（如com.example.app）',
-            },
-            spawn: {
-              type: 'boolean',
-              description: '是否启动新应用实例（默认false，附加到现有进程）',
-              default: false,
-            },
-            device_id: {
-              type: 'string',
-              description: '指定设备ID（可选，默认选择USB设备）',
-            },
-          },
-          required: ['target'],
-        },
-      },
-      {
-        name: 'frida_inject_script',
-        description: '向已附加的进程注入JavaScript脚本',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            script: {
-              type: 'string',
-              description: '要注入的JavaScript脚本代码',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-          required: ['script'],
-        },
-      },
-      {
-        name: 'frida_detach',
-        description: '从进程分离',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认分离所有会话）',
-            },
-          },
-        },
-      },
-      {
-        name: 'frida_list_processes',
-        description: '列出设备中的所有进程（优先移动设备）',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            filter: {
-              type: 'string',
-              description: '进程/应用名称过滤条件（可选）',
-            },
-            device_id: {
-              type: 'string',
-              description: '指定设备ID（可选，默认选择USB设备）',
-            },
-          },
-        },
-      },
-      {
-        name: 'frida_list_devices',
-        description: '枚举所有可用设备（本地/USB/远程）',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
-      },
-      {
-        name: 'frida_list_applications',
-        description: '列出设备上的所有应用（移动应用）',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            device_id: {
-              type: 'string',
-              description: '指定设备ID（可选，默认选择USB设备）',
-            },
-          },
-        },
-      },
-      {
-        name: 'frida_memory_search',
-        description: '在目标进程内存中搜索指定数据',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            pattern: {
-              type: 'string',
-              description: '搜索模式（十六进制字符串，如 "41 42 43" 或字符串）',
-            },
-            type: {
-              type: 'string',
-              enum: ['hex', 'string', 'utf8', 'utf16'],
-              description: '搜索类型（hex=十六进制，string=ASCII字符串，utf8/utf16=Unicode字符串）',
-              default: 'string',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-          required: ['pattern'],
-        },
-      },
-      {
-        name: 'frida_memory_write',
-        description: '修改目标进程内存中的数据',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            address: {
-              type: 'string',
-              description: '内存地址（十六进制，如 0x12345678）',
-            },
-            data: {
-              type: 'string',
-              description: '要写入的数据（十六进制字符串，如 "41 42 43"）',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-          required: ['address', 'data'],
-        },
-      },
-      {
-        name: 'frida_enumerate_classes',
-        description: '枚举目标应用的所有类（Java类或ObjC类）',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            filter: {
-              type: 'string',
-              description: '类名过滤条件（可选）',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-        },
-      },
-      {
-        name: 'frida_enumerate_methods',
-        description: '枚举指定类的所有方法',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            class_name: {
-              type: 'string',
-              description: '类名（如 java.lang.String 或 NSString）',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-          required: ['class_name'],
-        },
-      },
-      {
-        name: 'frida_find_function',
-        description: '查找函数地址和详细信息',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            function_name: {
-              type: 'string',
-              description: '函数名或方法名',
-            },
-            module_name: {
-              type: 'string',
-              description: '模块名（可选，如 libc、libssl 等）',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-          required: ['function_name'],
-        },
-      },
-      {
-        name: 'frida_batch_hook',
-        description: '批量Hook多个方法或函数',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            targets: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  class_name: { type: 'string' },
-                  method_name: { type: 'string' },
-                  hook_type: { 
-                    type: 'string',
-                    enum: ['log', 'block', 'modify'],
-                    default: 'log'
-                  },
-                },
-                required: ['class_name', 'method_name'],
-              },
-              description: 'Hook目标列表，每个对象包含class_name和method_name',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-          required: ['targets'],
-        },
-      },
-      {
-        name: 'frida_save_logs',
-        description: '保存Hook结果到文件',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            filename: {
-              type: 'string',
-              description: '保存的文件名（可选，默认使用时间戳）',
-            },
-            output_dir: {
-              type: 'string',
-              description: '输出目录绝对路径（可选，默认使用项目logs目录）',
-            },
-            format: {
-              type: 'string',
-              enum: ['json', 'txt', 'csv'],
-              description: '保存格式',
-              default: 'json',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-        },
-      },
-      {
-        name: 'frida_get_app_info',
-        description: '获取应用详细信息（包名、权限、版本等）',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            package_name: {
-              type: 'string',
-              description: '应用包名',
-            },
-            device_id: {
-              type: 'string',
-              description: '设备ID（可选，默认使用USB设备）',
-            },
-          },
-          required: ['package_name'],
-        },
-      },
-      {
-        name: 'frida_auto_recovery',
-        description: '启用自动崩溃恢复机制',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            enable: {
-              type: 'boolean',
-              description: '是否启用自动恢复',
-              default: true,
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-        },
-      },
-      {
-        name: 'frida_connection_status',
-        description: '获取所有连接状态和健康信息',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
-      },
-      {
-        name: 'frida_force_reconnect',
-        description: '强制重新连接到断开的会话',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-          },
-        },
-      },
-      {
-        name: 'frida_diagnose_environment',
-        description: '🔧 [环境诊断] 全面检测移动测试环境 - 设备连接、Frida服务、权限状态',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
-      },
-      {
-        name: 'frida_realtime_logs',
-        description: '启用/停止实时日志监听',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            action: {
-              type: 'string',
-              enum: ['start', 'stop', 'tail', 'stats'],
-              description: 'start=启动监听, stop=停止监听, tail=获取最近日志, stats=获取统计',
-            },
-            session_id: {
-              type: 'string',
-              description: '会话ID（可选，默认使用当前活动会话）',
-            },
-            lines: {
-              type: 'number',
-              description: '获取日志行数（仅tail模式，默认50）',
-              default: 50,
-            },
-          },
-          required: ['action'],
-        },
-      },
-
       // ===== ADB 设备管理工具 =====
       {
         name: 'adb_list_devices',
@@ -949,7 +694,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             tool_name: {
               type: 'string',
-              description: '工具名称（如adb_tap、frida_batch_hook）',
+              description: '工具名称（如adb_tap、aapt_dump_badging）',
             },
           },
           required: ['tool_name'],
@@ -972,53 +717,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ['tool_name', 'result'],
-        },
-      },
-      
-      // ===== Frida Gadget 自动部署工具 =====
-      {
-        name: 'frida_deploy_gadget',
-        description: '🚀 [高级功能] 自动部署Frida Gadget到目标应用 - 解决非root环境下的附加问题',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            package_name: {
-              type: 'string',
-              description: '目标应用包名（如com.example.app）',
-            },
-            target_arch: {
-              type: 'string',
-              enum: ['arm64', 'arm', 'x86_64', 'x86'],
-              description: '目标架构（默认arm64）',
-              default: 'arm64',
-            },
-            deployment_strategy: {
-              type: 'string',
-              enum: ['replace_lib', 'add_lib', 'manifest_modify'],
-              description: '部署策略（replace_lib=替换现有库, add_lib=添加新库, manifest_modify=修改清单）',
-              default: 'add_lib',
-            },
-            preserve_signature: {
-              type: 'boolean',
-              description: '是否保留原始签名（默认false，会重新签名）',
-              default: false,
-            },
-          },
-          required: ['package_name'],
-        },
-      },
-      {
-        name: 'frida_check_gadget_status',
-        description: '📊 [状态检查] 检查应用的Frida Gadget部署状态',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            package_name: {
-              type: 'string',
-              description: '要检查的应用包名',
-            },
-          },
-          required: ['package_name'],
         },
       },
       
@@ -1362,416 +1060,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case 'frida_attach': {
-        const { target, spawn = false, device_id } = args as { 
-          target: string; 
-          spawn?: boolean; 
-          device_id?: string;
-        };
-        
-        const result = await fridaManager.attach(target, spawn, device_id);
-        
-        // 轻量级验证（移动应用测试不需要严格限制）
-        securityManager.validateProcessAccess(result.process.name, result.process.pid);
-        
-        // 记录工具执行
-        workflowManager.recordToolExecution('frida_attach', result);
-        
-        // 获取标准流程的下一步建议
-        const suggestions = workflowManager.getSmartSuggestions();
-        const nextSteps = suggestions.slice(0, 3).map(s => 
-          `• ${s.tool} - ${s.reason}`
-        ).join('\n');
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `✅ 成功附加到移动应用: ${result.process.name} (PID: ${result.process.pid})\n📱 会话ID: ${result.sessionId}\n\n🎯 【阶段二】标准下一步:\n${nextSteps}\n\n💡 关键提醒:\n• 现在可以注入Hook脚本进行监控\n• 建议先验证连接稳定性再注入脚本`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_inject_script': {
-        const { script, session_id } = args as { script: string; session_id?: string };
-        
-        // 验证脚本安全性
-        securityManager.validateScript(script);
-        
-        const result = await fridaManager.injectScript(script, session_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `脚本注入成功\n脚本ID: ${result.scriptId}\n会话ID: ${result.sessionId}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_detach': {
-        const { session_id } = args as { session_id?: string };
-        await fridaManager.detach(session_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: session_id ? `已从会话 ${session_id} 分离` : '已从所有会话分离',
-            },
-          ],
-        };
-      }
 
-      case 'frida_list_processes': {
-        const { filter, device_id } = args as { filter?: string; device_id?: string };
-        const processes = await fridaManager.listProcesses(filter, device_id);
-        const processText = processes
-          .slice(0, 20) // 限制显示前20个
-          .map(p => `📱 ${p.name} (PID: ${p.pid})`)
-          .join('\n');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔍 找到 ${processes.length} 个进程 ${filter ? `(包含 "${filter}")` : ''}:\n${processText}${processes.length > 20 ? '\n... (显示前20个)' : ''}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_list_devices': {
-        const devices = await fridaManager.enumerateDevices();
-        const deviceText = devices
-          .map(d => `📱 ${d.name} (${d.type}) - ID: ${d.id}`)
-          .join('\n');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔍 发现 ${devices.length} 个设备:\n${deviceText}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_list_applications': {
-        const { device_id } = args as { device_id?: string };
-        const applications = await fridaManager.enumerateApplications(device_id);
-        const appText = applications
-          .slice(0, 15) // 限制显示前15个
-          .map(app => `📦 ${app.name} (${app.identifier})`)
-          .join('\n');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔍 找到 ${applications.length} 个应用:\n${appText}${applications.length > 15 ? '\n... (显示前15个)' : ''}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_memory_search': {
-        const { pattern, type = 'string', session_id } = args as { 
-          pattern: string; 
-          type?: 'hex' | 'string' | 'utf8' | 'utf16';
-          session_id?: string;
-        };
-        const result = await fridaManager.memorySearch(pattern, type, session_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔍 内存搜索结果:\n找到 ${result.count} 个匹配项\n地址列表:\n${result.addresses.slice(0, 10).join('\n')}${result.count > 10 ? '\n... (显示前10个)' : ''}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_memory_write': {
-        const { address, data, session_id } = args as { 
-          address: string; 
-          data: string; 
-          session_id?: string;
-        };
-        const result = await fridaManager.memoryWrite(address, data, session_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: result.success 
-                ? `✅ 内存写入成功\n地址: ${result.address}\n写入字节数: ${result.bytesWritten}`
-                : `❌ 内存写入失败\n地址: ${result.address}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_enumerate_classes': {
-        const { filter, session_id } = args as { filter?: string; session_id?: string };
-        const classes = await fridaManager.enumerateClasses(filter, session_id);
-        const classText = classes
-          .map(c => `📦 ${c.name} (${c.methods} 方法)`)
-          .join('\n');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔍 找到 ${classes.length} 个类 ${filter ? `(包含 "${filter}")` : ''}:\n${classText}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_enumerate_methods': {
-        const { class_name, session_id } = args as { class_name: string; session_id?: string };
-        const methods = await fridaManager.enumerateMethods(class_name, session_id);
-        const methodText = methods
-          .slice(0, 20)
-          .map(m => `🔧 ${m.name}`)
-          .join('\n');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔍 类 ${class_name} 的方法 (${methods.length} 个):\n${methodText}${methods.length > 20 ? '\n... (显示前20个)' : ''}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_find_function': {
-        const { function_name, module_name, session_id } = args as { 
-          function_name: string; 
-          module_name?: string;
-          session_id?: string;
-        };
-        const functions = await fridaManager.findFunction(function_name, module_name, session_id);
-        const funcText = functions
-          .map(f => `🎯 ${f.name} @ ${f.address} (${f.module})`)
-          .join('\n');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: functions.length > 0 
-                ? `🔍 找到 ${functions.length} 个函数:\n${funcText}`
-                : `❌ 未找到函数: ${function_name}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_batch_hook': {
-        const { targets, session_id } = args as { 
-          targets: Array<{class_name: string, method_name: string, hook_type: 'log' | 'block' | 'modify'}>;
-          session_id?: string;
-        };
-        const result = await fridaManager.batchHook(targets, session_id);
-        const detailText = result.details
-          .map(d => `${d.status === 'success' ? '✅' : '❌'} ${d.target}`)
-          .join('\n');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🎯 批量Hook结果:\n成功: ${result.success} 个\n失败: ${result.failed} 个\n\n详情:\n${detailText}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_save_logs': {
-        const { filename, output_dir, format = 'json', session_id } = args as { 
-          filename?: string; 
-          output_dir?: string;
-          format?: 'json' | 'txt' | 'csv';
-          session_id?: string;
-        };
-        const filePath = fridaManager.saveLogs(session_id || '', format, filename, output_dir);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `💾 日志已保存到: ${filePath}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_get_app_info': {
-        const { package_name, device_id } = args as { 
-          package_name: string; 
-          device_id?: string;
-        };
-        const appInfo = await fridaManager.getApplicationInfo(package_name, device_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `📱 应用信息:\n名称: ${appInfo.basic.name}\n包名: ${appInfo.basic.identifier}\nPID: ${appInfo.basic.pid || '未运行'}\n设备: ${appInfo.device}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_auto_recovery': {
-        const { enable = true, session_id } = args as { 
-          enable?: boolean; 
-          session_id?: string;
-        };
-        if (enable) {
-          fridaManager.enableAutoRecovery(session_id);
-        } else {
-          fridaManager.disableAutoRecovery(session_id);
-        }
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔄 自动崩溃恢复已${enable ? '启用' : '禁用'}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_connection_status': {
-        const connections = fridaManager.getConnectionStatuses();
-        const statusText = connections.length > 0 
-          ? connections
-              .map(c => `🔗 ${c.processName} (${c.sessionId.substring(0, 8)})\n   状态: ${c.status}\n   重试: ${c.retryCount}/${5}\n   PID: ${c.pid || 'N/A'}\n   心跳: ${new Date(c.lastHeartbeat).toLocaleTimeString()}`)
-              .join('\n\n')
-          : '❌ 无活动连接';
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `📊 连接状态报告:\n\n${statusText}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_force_reconnect': {
-        const { session_id } = args as { session_id?: string };
-        fridaManager.forceReconnection(session_id);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔄 强制重连已启动 ${session_id ? `(会话: ${session_id.substring(0, 8)})` : '(当前会话)'}`,
-            },
-          ],
-        };
-      }
 
-      case 'frida_diagnose_environment': {
-        const diagnosis = await fridaManager.diagnoseEnvironment();
-        
-        const statusText = Object.entries(diagnosis.fridaServerStatus)
-          .map(([deviceId, status]) => `  ${deviceId}: ${status}`)
-          .join('\n');
-        
-        const recommendationsText = diagnosis.recommendations.length > 0 
-          ? diagnosis.recommendations.map(rec => `• ${rec}`).join('\n\n')
-          : '✅ 环境配置正常，无需额外操作';
 
-        const capabilitiesText = Object.entries(diagnosis.deviceCapabilities)
-          .map(([deviceId, cap]) => `  📱 ${cap.name} (${cap.type})`)
-          .join('\n');
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `🔍 Frida 环境诊断报告:\n\n` +
-                    `📊 设备状态:\n${statusText}\n\n` +
-                    `📱 检测到的设备:\n${capabilitiesText}\n\n` +
-                    `💡 配置建议:\n${recommendationsText}`,
-            },
-          ],
-        };
-      }
-
-      case 'frida_realtime_logs': {
-        const { action, session_id, lines = 50 } = args as { 
-          action: 'start' | 'stop' | 'tail' | 'stats';
-          session_id?: string;
-          lines?: number;
-        };
-
-        switch (action) {
-          case 'start':
-            fridaManager.startRealtimeLogs(session_id);
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `📡 实时日志监听已启动 ${session_id ? `(会话: ${session_id.substring(0, 8)})` : '(当前会话)'}`,
-                },
-              ],
-            };
-
-          case 'stop':
-            fridaManager.stopRealtimeLogs(session_id);
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `⏹️ 实时日志监听已停止 ${session_id ? `(会话: ${session_id.substring(0, 8)})` : '(当前会话)'}`,
-                },
-              ],
-            };
-
-          case 'tail':
-            const logs = fridaManager.getTailLogs(session_id, lines);
-            const logText = logs.length > 0 
-              ? logs
-                  .map(log => {
-                    const time = new Date(log.timestamp).toLocaleTimeString();
-                    return `[${time}] [${log.type.toUpperCase()}] ${JSON.stringify(log.data)}`;
-                  })
-                  .join('\n')
-              : '📝 暂无日志';
-            
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `📄 最近 ${lines} 条日志:\n\n${logText}`,
-                },
-              ],
-            };
-
-          case 'stats':
-            const stats = fridaManager.getLogStats(session_id);
-            if (stats) {
-              const lastLogTime = stats.lastLogTime > 0 ? new Date(stats.lastLogTime).toLocaleString() : '从未';
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text: `📊 日志统计:\n总计: ${stats.totalLogs}\n错误: ${stats.errorCount}\nHook: ${stats.hookCount}\n网络: ${stats.networkCount}\n最后日志: ${lastLogTime}`,
-                  },
-                ],
-              };
-            } else {
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text: `❌ 无法获取日志统计`,
-                  },
-                ],
-              };
-            }
-
-          default:
-            throw new McpError(ErrorCode.InvalidParams, `未知的日志操作: ${action}`);
-        }
-      }
 
       // ===== ADB 设备管理工具 =====
       case 'adb_list_devices': {
@@ -2230,7 +1536,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const stepsText = template.steps.map((step, index) => 
+        const stepsText = template.steps.map((step: any, index: number) =>
           `**步骤 ${index + 1}: ${step.toolName}**\n` +
           `├── 描述: ${step.description}\n` +
           `├── 预期结果: ${step.expectedResult}\n` +
@@ -2249,8 +1555,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `├── 难度: ${template.difficulty}\n` +
                 `├── 预计时间: ${template.estimatedTime}\n` +
                 `└── 描述: ${template.description}\n\n` +
-                `**前置条件:**\n${template.prerequisites.map(p => `• ${p}`).join('\n')}\n\n` +
-                `**预期输出:**\n${template.expectedOutputs.map(o => `• ${o}`).join('\n')}\n\n` +
+                `**前置条件:**\n${template.prerequisites.map((p: string) => `• ${p}`).join('\n')}\n\n` +
+                `**预期输出:**\n${template.expectedOutputs.map((o: string) => `• ${o}`).join('\n')}\n\n` +
                 `**执行步骤:**\n${stepsText}`
             },
           ],
@@ -2320,6 +1626,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workflow_get_tool_help': {
         const { tool_name } = args as { tool_name: string };
+
         const help = workflowManager.getToolCollaborationHelp(tool_name);
         
         return {
@@ -2327,11 +1634,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text: `🛠️ **工具协作指南: ${tool_name}**\n\n` +
-                (help.recommended_before ? `**建议前置工具:**\n${help.recommended_before.map((t: string) => `• ${t}`).join('\n')}\n\n` : '') +
-                (help.recommended_after ? `**建议后续工具:**\n${help.recommended_after.map((t: string) => `• ${t}`).join('\n')}\n\n` : '') +
+                (help.recommended_before && help.recommended_before.length > 0 ? `**建议前置工具:**\n${help.recommended_before.map((t: string) => `• ${t}`).join('\n')}\n\n` : '') +
+                (help.recommended_after && help.recommended_after.length > 0 ? `**建议后续工具:**\n${help.recommended_after.map((t: string) => `• ${t}`).join('\n')}\n\n` : '') +
                 (help.tips ? `**使用技巧:**\n${help.tips.map((t: string) => `• ${t}`).join('\n')}\n\n` : '') +
                 (help.warnings ? `**⚠️ 注意事项:**\n${help.warnings.map((w: string) => `• ${w}`).join('\n')}\n\n` : '') +
-                (help.common_workflows ? `**常用工作流:**\n${help.common_workflows.map((w: string) => `• ${w}`).join('\n')}\n\n` : '') +
+                (help.common_workflows && help.common_workflows.length > 0 ? `**常用工作流:**\n${help.common_workflows.map((w: string) => `• ${w}`).join('\n')}\n\n` : '') +
                 (help.general_tips ? `**通用建议:**\n${help.general_tips.map((t: string) => `• ${t}`).join('\n')}` : '') +
                 (help.message ? help.message : '')
             },
@@ -2352,117 +1659,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
-      }
-
-      // ===== Frida Gadget 自动部署工具处理 =====
-      case 'frida_deploy_gadget': {
-        const { package_name, target_arch = 'arm64', deployment_strategy = 'add_lib', preserve_signature = false } = args as {
-          package_name: string;
-          target_arch?: string;
-          deployment_strategy?: string;
-          preserve_signature?: boolean;
-        };
-        
-        try {
-          console.log(`[MCP] 开始部署Frida Gadget到 ${package_name}`);
-          
-          const result = await gadgetManager.deployGadget({
-            packageName: package_name,
-            targetArch: target_arch as any,
-            deploymentStrategy: deployment_strategy as any,
-            preserveSignature: preserve_signature,
-          });
-          
-          if (result.success) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `🚀 Frida Gadget部署成功！\n\n` +
-                        `📦 应用: ${package_name}\n` +
-                        `🏗️ 架构: ${target_arch}\n` +
-                        `⚙️ 策略: ${deployment_strategy}\n` +
-                        `📁 APK路径: ${result.packagePath || '未知'}\n` +
-                        `💾 备份路径: ${result.originalBackup || '未知'}\n\n` +
-                        `✅ 现在可以使用 \`frida_attach\` 直接附加到应用，无需root权限！\n\n` +
-                        `🎯 下一步建议:\n` +
-                        `• 使用 adb_start_app 启动应用\n` +
-                        `• 使用 frida_attach 附加到进程\n` +
-                        `• 开始动态分析和Hook操作`
-                },
-              ],
-            };
-          } else {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `❌ Frida Gadget部署失败\n\n` +
-                        `错误信息: ${result.error}\n\n` +
-                        `💡 可能的解决方案:\n` +
-                        `• 确认应用已安装: adb_list_packages\n` +
-                        `• 检查设备连接: adb_list_devices\n` +
-                        `• 确认有足够的存储空间\n` +
-                        `• 检查应用是否允许重新安装\n\n` +
-                        `📝 如需帮助，请使用 frida_diagnose_environment`
-                },
-              ],
-            };
-          }
-        } catch (error: any) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `💥 Gadget部署过程中出现异常:\n${error.message}\n\n` +
-                      `🔧 故障排除:\n` +
-                      `• 检查adb连接状态\n` +
-                      `• 确认应用包名正确\n` +
-                      `• 检查设备存储空间\n` +
-                      `• 尝试手动启动应用后重试`
-              },
-            ],
-          };
-        }
-      }
-
-      case 'frida_check_gadget_status': {
-        const { package_name } = args as { package_name: string };
-        
-        try {
-          const hasGadget = await gadgetManager.checkGadgetStatus(package_name);
-          
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `📊 Gadget状态检查: ${package_name}\n\n` +
-                      `状态: ${hasGadget ? '✅ 已部署Gadget' : '❌ 未检测到Gadget'}\n\n` +
-                      (hasGadget 
-                        ? `🎉 应用已包含Frida Gadget，可以直接使用:\n` +
-                          `• frida_attach ${package_name}\n` +
-                          `• 无需root权限即可进行动态分析`
-                        : `💡 建议操作:\n` +
-                          `• 使用 frida_deploy_gadget 部署Gadget\n` +
-                          `• 或确认应用正在运行并包含Gadget库`
-                      )
-              },
-            ],
-          };
-        } catch (error: any) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `❌ 无法检查Gadget状态: ${error.message}\n\n` +
-                      `请确认:\n` +
-                      `• 设备连接正常\n` +
-                      `• 应用包名正确\n` +
-                      `• 有必要的权限`
-              },
-            ],
-          };
-        }
       }
 
       // ===== AAPT APK分析工具处理 =====
@@ -2530,7 +1726,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                       `🔧 解决建议:\n` +
                       `• 确保Android SDK已安装\n` +
                       `• 检查APK文件是否存在: ${apk_path}\n` +
-                      `• 使用 frida_diagnose_environment 检查环境`
+                      `• 使用 adb_list_devices 检查设备连接环境`
               },
             ],
           };
@@ -2571,7 +1767,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                       `🔍 权限分析建议:\n` +
                       `• 关注敏感权限 (CAMERA, LOCATION, CONTACTS等)\n` +
                       `• 检查是否有过度申请权限\n` +
-                      `• 使用 frida_attach 进行运行时权限分析`
+                      `• 使用 adb_start_app + adb_shell_command 进行运行时验证`
               },
             ],
           };
@@ -2653,9 +1849,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                       `${generateSecurityAssessment(badging, permissions || [])}\n\n` +
                       
                       `🎯 后续分析建议:\n` +
-                      `• 使用 frida_deploy_gadget 部署Gadget (如需动态分析)\n` +
                       `• 使用 adb_start_app 启动应用\n` +
-                      `• 使用 frida_attach 进行Hook分析\n` +
+                      `• 使用 adb_screenshot 记录关键页面状态\n` +
+                      `• 使用 jadx_decompile_apk 深入代码分析\n` +
                       `• 关注可调试应用的安全风险`
               },
             ],
@@ -3423,11 +2619,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function main() {
+  const runtimeDependencies = await checkRuntimeDependencies();
+  printDependencyGuidance(runtimeDependencies);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  console.log('[MCP] mobile-app-testing-mcp 已启动，等待客户端连接...');
   
   process.on('SIGINT', async () => {
-    await fridaManager.cleanup();
     process.exit(0);
   });
 }

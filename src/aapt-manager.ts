@@ -3,9 +3,10 @@
 
 import { execSync, exec } from 'child_process';
 import { promisify } from 'util';
-import { existsSync, statSync, readFileSync } from 'fs';
+import { existsSync, statSync, readFileSync, readdirSync } from 'fs';
 import { join, dirname, basename, extname } from 'path';
 import { globalLogger } from './logger.js';
+import { getEnvValue, loadProjectEnv } from './env-utils.js';
 
 const execAsync = promisify(exec);
 
@@ -74,38 +75,48 @@ export class AAPTManager {
   private aaptPath: string | null = null;
   
   constructor() {
+    loadProjectEnv();
     this.detectAAPTPath();
   }
 
   private detectAAPTPath(): void {
-    const possiblePaths = [
+    const possiblePaths: string[] = [
+      // 显式配置优先
+      getEnvValue('AAPT_PATH'),
       // Android SDK 标准路径
       process.env.ANDROID_HOME ? join(process.env.ANDROID_HOME, 'build-tools') : null,
       process.env.ANDROID_SDK_ROOT ? join(process.env.ANDROID_SDK_ROOT, 'build-tools') : null,
       // Homebrew 安装路径 (macOS)
       '/opt/homebrew/bin/aapt',
       '/usr/local/bin/aapt',
+      // Windows 常见路径
+      process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Android', 'Sdk', 'build-tools') : null,
+      process.env.ANDROID_HOME ? join(process.env.ANDROID_HOME, 'build-tools', 'aapt.exe') : null,
+      process.env.ANDROID_SDK_ROOT ? join(process.env.ANDROID_SDK_ROOT, 'build-tools', 'aapt.exe') : null,
       // 系统PATH中的aapt
       'aapt'
-    ].filter(Boolean);
+    ].filter((value): value is string => Boolean(value));
 
     for (const path of possiblePaths) {
       try {
-        if (path && path.includes('build-tools')) {
+        if (path && path.includes('build-tools') && !path.endsWith('.exe')) {
           // 在build-tools目录中查找最新版本的aapt
           const buildToolsPath = this.findLatestBuildTools(path);
           if (buildToolsPath) {
-            const aaptBinary = join(buildToolsPath, 'aapt');
-            if (existsSync(aaptBinary)) {
-              execSync(`"${aaptBinary}" version`, { stdio: 'ignore' });
-              this.aaptPath = aaptBinary;
-              console.log(`[AAPT] 找到AAPT: ${aaptBinary}`);
-              return;
+            const candidates = [join(buildToolsPath, 'aapt'), join(buildToolsPath, 'aapt.exe')];
+            for (const aaptBinary of candidates) {
+              if (existsSync(aaptBinary)) {
+                execSync(`"${aaptBinary}" version`, { stdio: 'ignore' });
+                this.aaptPath = aaptBinary;
+                console.log(`[AAPT] 找到AAPT: ${aaptBinary}`);
+                return;
+              }
             }
           }
         } else {
           // 直接测试aapt命令
-          execSync(path === 'aapt' ? 'aapt version' : `"${path}" version`, { stdio: 'ignore' });
+          const cmd = path === 'aapt' ? 'aapt version' : `"${path}" version`;
+          execSync(cmd, { stdio: 'ignore' });
           this.aaptPath = path;
           console.log(`[AAPT] 找到AAPT: ${path}`);
           return;
@@ -125,9 +136,9 @@ export class AAPTManager {
         return null;
       }
 
-      const versions = execSync(`ls "${buildToolsDir}"`, { encoding: 'utf8' })
-        .trim()
-        .split('\n')
+      const versions = readdirSync(buildToolsDir, { withFileTypes: true })
+        .filter(item => item.isDirectory())
+        .map(item => item.name)
         .filter(version => version.match(/^\d+\.\d+/))
         .sort((a, b) => {
           const parseVersion = (v: string) => v.split('.').map(n => parseInt(n, 10));

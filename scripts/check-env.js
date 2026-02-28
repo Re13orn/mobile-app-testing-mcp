@@ -1,168 +1,209 @@
 #!/usr/bin/env node
-// 环境依赖检查脚本
 
-import { spawn, exec } from 'child_process';
-import { promisify } from 'util';
-import { existsSync } from 'fs';
+import { existsSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { spawnSync } from 'child_process';
+import { getEnvValue, getProjectRoot, loadProjectEnv } from './env-utils.js';
 
-const execAsync = promisify(exec);
+loadProjectEnv();
+process.chdir(getProjectRoot());
 
 console.log('🔍 检查移动端App测试MCP环境依赖...\n');
 
-const checks = [];
-
-// 检查Node.js版本
-async function checkNodeVersion() {
-  try {
-    const version = process.version.slice(1); // 移除'v'
-    const major = parseInt(version.split('.')[0]);
-    
-    if (major >= 18) {
-      console.log(`✅ Node.js: ${process.version}`);
-      return true;
-    } else {
-      console.log(`❌ Node.js: ${process.version} (需要 18.0+)`);
-      return false;
-    }
-  } catch (error) {
-    console.log(`❌ Node.js: 检查失败`);
-    return false;
-  }
+function runVersionCommand(command, args) {
+  const result = spawnSync(command, args, { encoding: 'utf8', stdio: 'pipe', shell: false });
+  return {
+    ok: result.status === 0,
+    stdout: (result.stdout || '').trim(),
+    stderr: (result.stderr || '').trim()
+  };
 }
 
-// 检查ADB
-async function checkADB() {
-  try {
-    const { stdout } = await execAsync('adb version');
-    console.log(`✅ ADB: ${stdout.split('\n')[0]}`);
+function findLatestBuildTools(sdkPath) {
+  const buildToolsDir = join(sdkPath, 'build-tools');
+  if (!existsSync(buildToolsDir)) {
+    return null;
+  }
+
+  const versions = readdirSync(buildToolsDir, { withFileTypes: true })
+    .filter(item => item.isDirectory() && /^\d+\.\d+/.test(item.name))
+    .map(item => item.name)
+    .sort((a, b) => {
+      const parse = value => value.split('.').map(num => parseInt(num, 10));
+      const left = parse(a);
+      const right = parse(b);
+      const maxLen = Math.max(left.length, right.length);
+      for (let i = 0; i < maxLen; i++) {
+        const l = left[i] || 0;
+        const r = right[i] || 0;
+        if (l !== r) {
+          return r - l;
+        }
+      }
+      return 0;
+    });
+
+  return versions.length > 0 ? join(buildToolsDir, versions[0]) : null;
+}
+
+function checkNodeVersion() {
+  const version = process.version.slice(1);
+  const major = parseInt(version.split('.')[0], 10);
+  if (major >= 18) {
+    console.log(`✅ Node.js: ${process.version}`);
     return true;
-  } catch (error) {
-    console.log(`❌ ADB: 未找到或无法执行`);
-    console.log(`   安装方法: 下载 Android SDK Platform Tools`);
-    return false;
   }
+  console.log(`❌ Node.js: ${process.version} (需要 18.0+)`);
+  return false;
 }
 
-// 检查AAPT
-async function checkAAPT() {
-  try {
-    // 先检查环境变量中的路径
-    if (process.env.ANDROID_HOME) {
-      const aaptPath = join(process.env.ANDROID_HOME, 'build-tools');
-      if (existsSync(aaptPath)) {
-        console.log(`✅ AAPT: 在 Android SDK 中找到`);
-        return true;
+function checkADB() {
+  const adbPath = getEnvValue('ADB_PATH') || 'adb';
+  const result = runVersionCommand(adbPath, ['version']);
+  if (result.ok) {
+    const firstLine = result.stdout.split('\n')[0];
+    console.log(`✅ ADB: ${firstLine || adbPath}`);
+    return true;
+  }
+  console.log(`❌ ADB: 未找到或无法执行 (${adbPath})`);
+  console.log('   安装方法: Android SDK Platform Tools');
+  return false;
+}
+
+function checkAAPT() {
+  const configuredPath = getEnvValue('AAPT_PATH');
+  if (configuredPath) {
+    const result = runVersionCommand(configuredPath, ['version']);
+    if (result.ok) {
+      console.log(`✅ AAPT: ${result.stdout.split('\n')[0] || configuredPath}`);
+      return true;
+    }
+  }
+
+  const sdkPath = getEnvValue('ANDROID_HOME', 'ANDROID_SDK_ROOT');
+  if (sdkPath) {
+    const latestBuildTools = findLatestBuildTools(sdkPath);
+    if (latestBuildTools) {
+      const aaptCandidates = [join(latestBuildTools, 'aapt'), join(latestBuildTools, 'aapt.exe')];
+      for (const candidate of aaptCandidates) {
+        if (!existsSync(candidate)) {
+          continue;
+        }
+        const result = runVersionCommand(candidate, ['version']);
+        if (result.ok) {
+          console.log(`✅ AAPT: ${candidate}`);
+          return true;
+        }
       }
     }
-    
-    // 检查系统PATH
-    const { stdout } = await execAsync('aapt version');
-    console.log(`✅ AAPT: ${stdout.split('\n')[0]}`);
-    return true;
-  } catch (error) {
-    console.log(`❌ AAPT: 未找到`);
-    console.log(`   需要: Android SDK Build Tools`);
-    return false;
   }
+
+  const result = runVersionCommand('aapt', ['version']);
+  if (result.ok) {
+    console.log(`✅ AAPT: ${result.stdout.split('\n')[0] || 'aapt'}`);
+    return true;
+  }
+
+  console.log('⚠️  AAPT: 未找到 (推荐)');
+  console.log('   需要 Android SDK Build Tools，或在 .env 中设置 AAPT_PATH');
+  return false;
 }
 
-// 检查JADX
-async function checkJADX() {
-  // 检查项目本地JADX
-  const localJadx = join(process.cwd(), 'jadx', 'bin', 'jadx');
-  if (existsSync(localJadx)) {
-    console.log(`✅ JADX: 项目本地版本`);
+function checkJADX() {
+  const configuredPath = getEnvValue('JADX_PATH');
+  if (configuredPath) {
+    const configured = runVersionCommand(configuredPath, ['--version']);
+    if (configured.ok) {
+      console.log(`✅ JADX: ${configuredPath}`);
+      return true;
+    }
+  }
+
+  const localCandidates = [
+    join(process.cwd(), 'jadx', 'bin', 'jadx'),
+    join(process.cwd(), 'jadx', 'bin', 'jadx.bat')
+  ];
+  for (const candidate of localCandidates) {
+    if (!existsSync(candidate)) {
+      continue;
+    }
+    const result = runVersionCommand(candidate, ['--version']);
+    if (result.ok) {
+      console.log(`✅ JADX: ${candidate}`);
+      return true;
+    }
+  }
+
+  const result = runVersionCommand('jadx', ['--version']);
+  if (result.ok) {
+    console.log('✅ JADX: 系统版本');
     return true;
   }
-  
-  // 检查系统JADX
-  try {
-    const { stdout } = await execAsync('jadx --version');
-    console.log(`✅ JADX: 系统版本`);
-    return true;
-  } catch (error) {
-    console.log(`⚠️  JADX: 未找到 (可选)`);
-    console.log(`   安装: 运行 scripts/setup.sh 或手动下载`);
-    return null; // null表示可选依赖
-  }
+
+  console.log('⚠️  JADX: 未找到 (可选)');
+  console.log('   安装后可启用 APK 反编译能力');
+  return null;
 }
 
-// 检查Frida
-async function checkFrida() {
-  try {
-    const { stdout } = await execAsync('frida --version');
-    console.log(`✅ Frida: ${stdout.trim()}`);
-    return true;
-  } catch (error) {
-    console.log(`⚠️  Frida: 未找到 (可选)`);
-    console.log(`   安装: pip install frida-tools`);
-    return null; // null表示可选依赖
-  }
-}
-
-// 检查Android SDK环境变量
 function checkAndroidSDK() {
-  if (process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT) {
-    const sdkPath = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
+  const sdkPath = getEnvValue('ANDROID_HOME', 'ANDROID_SDK_ROOT');
+  if (sdkPath) {
     console.log(`✅ Android SDK: ${sdkPath}`);
     return true;
-  } else {
-    console.log(`⚠️  Android SDK: 环境变量未设置`);
-    console.log(`   建议设置 ANDROID_HOME 或 ANDROID_SDK_ROOT`);
-    return false;
   }
+  console.log('⚠️  Android SDK: 环境变量未设置');
+  console.log('   建议设置 ANDROID_HOME 或 ANDROID_SDK_ROOT（可写入 .env）');
+  return false;
 }
 
-// 运行所有检查
-async function runAllChecks() {
-  const results = {
-    node: await checkNodeVersion(),
-    adb: await checkADB(),
-    aapt: await checkAAPT(),
-    jadx: await checkJADX(),
-    frida: await checkFrida(),
-    androidSDK: checkAndroidSDK()
-  };
-  
-  console.log('\n📊 检查结果汇总:');
-  
+function summarize(results) {
   const required = ['node', 'adb'];
-  const optional = ['jadx', 'frida'];
   const recommended = ['aapt', 'androidSDK'];
-  
-  let allRequiredOk = true;
-  
+  const optional = ['jadx'];
+
+  console.log('\n📊 检查结果汇总:');
+
+  let requiredOk = true;
   console.log('\n🔴 必需依赖:');
   for (const key of required) {
-    const status = results[key] ? '✅' : '❌';
-    console.log(`  ${status} ${key}`);
-    if (!results[key]) allRequiredOk = false;
+    const ok = results[key] === true;
+    console.log(`  ${ok ? '✅' : '❌'} ${key}`);
+    if (!ok) {
+      requiredOk = false;
+    }
   }
-  
+
   console.log('\n🟡 推荐依赖:');
   for (const key of recommended) {
-    const status = results[key] ? '✅' : '⚠️ ';
-    console.log(`  ${status} ${key}`);
+    const ok = results[key] === true;
+    console.log(`  ${ok ? '✅' : '⚠️ '} ${key}`);
   }
-  
+
   console.log('\n🟢 可选依赖:');
   for (const key of optional) {
-    const status = results[key] === true ? '✅' : 
-                   results[key] === null ? '⚠️ ' : '❌';
-    console.log(`  ${status} ${key}`);
+    const value = results[key];
+    const icon = value === true ? '✅' : value === null ? '⚠️ ' : '❌';
+    console.log(`  ${icon} ${key}`);
   }
-  
-  if (allRequiredOk) {
+
+  if (requiredOk) {
     console.log('\n🎉 环境检查通过！可以启动 MCP 服务器。');
     console.log('运行命令: npm start');
   } else {
     console.log('\n❌ 存在必需依赖缺失，请先安装。');
-    console.log('运行命令: scripts/setup.sh');
+    console.log('运行命令: npm run setup');
   }
-  
-  return allRequiredOk;
+
+  return requiredOk;
 }
 
-// 运行检查
-runAllChecks().catch(console.error);
+const results = {
+  node: checkNodeVersion(),
+  adb: checkADB(),
+  aapt: checkAAPT(),
+  jadx: checkJADX(),
+  androidSDK: checkAndroidSDK()
+};
+
+const ready = summarize(results);
+process.exit(ready ? 0 : 1);
