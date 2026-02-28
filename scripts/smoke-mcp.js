@@ -57,10 +57,10 @@ function ensure(condition, message) {
 async function main() {
   console.log('🧪 开始 MCP smoke 测试...');
 
-  const distEntry = resolve(projectRoot, 'dist/index.js');
+  const distEntry = resolve(projectRoot, 'dist/stdio-entry.js');
   ensure(
     existsSync(distEntry),
-    '未找到 dist/index.js，请先执行: npm run build'
+    '未找到 dist/stdio-entry.js，请先执行: npm run build'
   );
 
   const transport = new StdioClientTransport({

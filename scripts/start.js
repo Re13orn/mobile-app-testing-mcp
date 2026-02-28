@@ -5,6 +5,7 @@ import { join, resolve } from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { pipeline } from 'stream/promises';
 import { get as httpsGet } from 'https';
+import { format } from 'util';
 import { getEnvValue, getProjectRoot, loadProjectEnv } from './env-utils.js';
 
 loadProjectEnv();
@@ -15,6 +16,10 @@ const IS_WINDOWS = process.platform === 'win32';
 const ADB_BIN = IS_WINDOWS ? 'adb.exe' : 'adb';
 const AAPT_BIN = IS_WINDOWS ? 'aapt.exe' : 'aapt';
 const JADX_BIN = IS_WINDOWS ? 'jadx.bat' : 'jadx';
+
+function log(...args) {
+  process.stderr.write(`${format(...args)}\n`);
+}
 
 function toBool(value, defaultValue) {
   if (value === undefined) {
@@ -229,7 +234,7 @@ async function ensureJadx(version, downloadUrl, autoDownload) {
     return { path: null, installedNow: false };
   }
 
-  console.log(`[Start] 未检测到 JADX，尝试自动下载 v${version}...`);
+  log(`[Start] 未检测到 JADX，尝试自动下载 v${version}...`);
 
   const toolsDir = join(projectRoot, 'tools');
   const archivePath = join(toolsDir, `jadx-${version}.zip`);
@@ -256,44 +261,55 @@ async function ensureJadx(version, downloadUrl, autoDownload) {
 }
 
 function printSummary(summary) {
-  console.log('\n[Start] 依赖检查结果:');
+  log('\n[Start] 依赖检查结果:');
   for (const item of summary) {
     const icon = item.ok ? '✅' : item.level === 'required' ? '❌' : '⚠️';
-    console.log(`  ${icon} ${item.name} (${item.level}) - ${item.detail}`);
+    log(`  ${icon} ${item.name} (${item.level}) - ${item.detail}`);
   }
 }
 
 function printGuidance(summary) {
   const missing = summary.filter(item => !item.ok);
   if (missing.length === 0) {
-    console.log('[Start] 环境检查通过，启动 MCP 服务...');
+    log('[Start] 环境检查通过，启动 MCP 服务...');
     return;
   }
 
-  console.log('\n[Start] 配置建议:');
+  log('\n[Start] 配置建议:');
   if (missing.some(item => item.name === 'adb')) {
-    console.log('  1. 安装 Android SDK Platform Tools（提供 adb）');
-    console.log('  2. 设置 ADB_PATH，或将 platform-tools 加入 PATH');
+    log('  1. 安装 Android SDK Platform Tools（提供 adb）');
+    log('  2. 设置 ADB_PATH，或将 platform-tools 加入 PATH');
   }
   if (missing.some(item => item.name === 'aapt')) {
-    console.log('  3. 安装 Android SDK Build Tools（提供 aapt）');
-    console.log('  4. 设置 AAPT_PATH，或设置 ANDROID_HOME / ANDROID_SDK_ROOT');
+    log('  3. 安装 Android SDK Build Tools（提供 aapt）');
+    log('  4. 设置 AAPT_PATH，或设置 ANDROID_HOME / ANDROID_SDK_ROOT');
   }
   if (missing.some(item => item.name === 'jadx')) {
-    console.log('  5. 手动安装 JADX，或保持 AUTO_DOWNLOAD_JADX=true 自动下载');
-    console.log('  6. 设置 JADX_PATH，或将 jadx 加入 PATH');
+    log('  5. 手动安装 JADX，或保持 AUTO_DOWNLOAD_JADX=true 自动下载');
+    log('  6. 设置 JADX_PATH，或将 jadx 加入 PATH');
   }
-  console.log('  7. 执行 npm run check 查看详细状态');
+  log('  7. 执行 npm run check 查看详细状态');
 }
 
 function runServer() {
-  const distEntry = resolve(projectRoot, 'dist', 'index.js');
-  if (!existsSync(distEntry)) {
-    console.error('[Start] 未找到 dist/index.js，请先执行: npm run build');
-    process.exit(1);
+  const serverEntry = resolve(projectRoot, 'dist', 'stdio-entry.js');
+  if (!existsSync(serverEntry)) {
+    log('[Start] 未找到 dist/stdio-entry.js，尝试自动构建...');
+    const buildScript = resolve(projectRoot, 'scripts', 'build.js');
+    const buildResult = runCommand(process.execPath, [buildScript], { stdio: 'pipe' });
+    if (buildResult.stdout) {
+      process.stderr.write(buildResult.stdout);
+    }
+    if (buildResult.stderr) {
+      process.stderr.write(buildResult.stderr);
+    }
+    if (buildResult.status !== 0 || !existsSync(serverEntry)) {
+      console.error('[Start] 构建失败，无法启动 MCP。请手动执行: npm run build');
+      process.exit(1);
+    }
   }
 
-  const child = spawn(process.execPath, [distEntry], {
+  const child = spawn(process.execPath, [serverEntry], {
     cwd: projectRoot,
     env: process.env,
     stdio: 'inherit',
@@ -321,7 +337,7 @@ async function main() {
     `https://github.com/skylot/jadx/releases/download/v${jadxVersion}/jadx-${jadxVersion}.zip`;
   const autoDownloadJadx = toBool(getEnvValue('AUTO_DOWNLOAD_JADX'), true);
 
-  console.log('[Start] 准备启动移动端App测试MCP...');
+  log('[Start] 准备启动移动端App测试MCP...');
 
   const adbPath = detectAdbPath();
   const aaptPath = detectAaptPath();
@@ -347,7 +363,7 @@ async function main() {
   }
 
   if (jadxInstalledNow) {
-    console.log(`[Start] JADX 首次下载完成: ${jadxPath}`);
+    log(`[Start] JADX 首次下载完成: ${jadxPath}`);
   }
 
   const summary = [
