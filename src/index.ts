@@ -13,7 +13,13 @@ import { globalADBManager } from './adb-manager.js';
 import { globalWorkflowManager } from './workflow-manager.js';
 import { globalAAPTManager } from './aapt-manager.js';
 import { globalJADXManager } from './jadx-manager.js';
-import { StaticAnalyzer } from './static-analyzer.js';
+import { globalLogger } from './logger.js';
+import {
+  StaticAnalyzer,
+  type SecurityFinding,
+  type StaticAnalysisResult,
+  type StaticScanOptions
+} from './static-analyzer.js';
 import {
   buildMarkdownReport,
   buildSarifReport,
@@ -145,6 +151,583 @@ function parseReportFormats(input: unknown): ReportFormat[] {
   return formats;
 }
 
+type RuntimeErrorCode =
+  | 'OK'
+  | 'E_TIMEOUT'
+  | 'E_DEVICE_NOT_FOUND'
+  | 'E_DEVICE_OFFLINE'
+  | 'E_PERMISSION_DENIED'
+  | 'E_ADB_UNAVAILABLE'
+  | 'E_COMMAND_FAILED'
+  | 'E_PRECHECK_FAILED'
+  | 'E_UNKNOWN';
+
+type ToolAssessment = {
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  cwe: string;
+  masvs: string[];
+  evidence: string;
+  repro: string[];
+  fix: string;
+  code: RuntimeErrorCode;
+};
+
+type ResilienceOptions = {
+  maxAttempts: number;
+  timeoutMs: number;
+  retryDelayMs: number;
+};
+
+type ResilientExecutionResult<T> = {
+  success: boolean;
+  attempts: number;
+  durationMs: number;
+  code: RuntimeErrorCode;
+  data?: T;
+  error?: string;
+};
+
+type SessionCheck = {
+  key: string;
+  title: string;
+  status: 'pass' | 'fail' | 'skip';
+  code: RuntimeErrorCode;
+  detail: string;
+  evidence: string;
+  fix: string;
+};
+
+type SessionPrecheckResult = {
+  ok: boolean;
+  deviceId: string | null;
+  checks: SessionCheck[];
+  generatedAt: string;
+};
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function parseStringArray(input: unknown): string[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+  return input
+    .filter(item => typeof item === 'string')
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function createStaticScanOptions(args: Record<string, unknown>): StaticScanOptions {
+  const includeThirdParty = args.include_third_party === true;
+  const thirdPartyPrefixes = parseStringArray(args.third_party_prefixes);
+  return {
+    includeThirdParty,
+    thirdPartyPrefixes: thirdPartyPrefixes.length > 0 ? thirdPartyPrefixes : undefined
+  };
+}
+
+function isThirdPartyFilePath(filePath: string, options: StaticScanOptions): boolean {
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+  const defaults = [
+    '/androidx/',
+    '/android/support/',
+    '/support/',
+    '/com/google/android/material/',
+    '/kotlin/',
+    '/kotlinx/',
+    '/okhttp3/',
+    '/retrofit2/'
+  ];
+  const prefixes = (options.thirdPartyPrefixes && options.thirdPartyPrefixes.length > 0
+    ? options.thirdPartyPrefixes
+    : defaults).map(prefix => prefix.replace(/\\/g, '/').toLowerCase());
+  return prefixes.some(prefix => normalized.includes(prefix));
+}
+
+function buildFindingsSummary(findings: SecurityFinding[]): StaticAnalysisResult['summary'] {
+  return {
+    totalFindings: findings.length,
+    critical: findings.filter(f => f.severity === 'critical').length,
+    high: findings.filter(f => f.severity === 'high').length,
+    medium: findings.filter(f => f.severity === 'medium').length,
+    low: findings.filter(f => f.severity === 'low').length,
+    info: findings.filter(f => f.severity === 'info').length
+  };
+}
+
+function buildScopeSummary(
+  findings: SecurityFinding[],
+  options: StaticScanOptions
+): StaticAnalysisResult['scopeSummary'] {
+  return {
+    businessFindings: findings.filter(f => !isThirdPartyFilePath(f.file, options)).length,
+    thirdPartyFindings: findings.filter(f => isThirdPartyFilePath(f.file, options)).length,
+    businessHighRisk: findings.filter(
+      f => !isThirdPartyFilePath(f.file, options) && (f.severity === 'critical' || f.severity === 'high')
+    ).length,
+    thirdPartyHighRisk: findings.filter(
+      f => isThirdPartyFilePath(f.file, options) && (f.severity === 'critical' || f.severity === 'high')
+    ).length
+  };
+}
+
+function buildUnifiedReportFromFindings(params: {
+  targetPath: string;
+  findings: SecurityFinding[];
+  scannedFiles: number;
+  skippedThirdPartyFiles: number;
+  scanTimeMs: number;
+  scanOptions: StaticScanOptions;
+}) {
+  const analysis: StaticAnalysisResult = {
+    summary: buildFindingsSummary(params.findings),
+    scopeSummary: buildScopeSummary(params.findings, params.scanOptions),
+    findings: params.findings,
+    scanTime: params.scanTimeMs,
+    scannedFiles: params.scannedFiles,
+    skippedThirdPartyFiles: params.skippedThirdPartyFiles
+  };
+  return buildUnifiedSecurityReport(params.targetPath, analysis);
+}
+
+function parseResilienceOptions(
+  args: Record<string, unknown>,
+  defaults: { timeoutMs: number; retryCount: number; retryDelayMs: number }
+): ResilienceOptions {
+  const retryCount = clampInt(args.retry_count, defaults.retryCount, 0, 5);
+  const timeoutMs = clampInt(args.timeout_ms, defaults.timeoutMs, 1000, 180000);
+  const retryDelayMs = clampInt(args.retry_delay_ms, defaults.retryDelayMs, 0, 10000);
+  return {
+    maxAttempts: retryCount + 1,
+    timeoutMs,
+    retryDelayMs
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, operationName: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${operationName} timeout after ${timeoutMs}ms`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function classifyRuntimeError(errorMessage: string): RuntimeErrorCode {
+  const normalized = errorMessage.toLowerCase();
+  if (normalized.includes('timeout')) {
+    return 'E_TIMEOUT';
+  }
+  if (
+    normalized.includes('adb') &&
+    (
+      normalized.includes('not recognized') ||
+      normalized.includes('enoent') ||
+      normalized.includes('unable to access') ||
+      normalized.includes('command not found') ||
+      (normalized.includes('not found') && !normalized.includes('device'))
+    )
+  ) {
+    return 'E_ADB_UNAVAILABLE';
+  }
+  if (normalized.includes('device') && normalized.includes('offline')) {
+    return 'E_DEVICE_OFFLINE';
+  }
+  if (normalized.includes('no devices') || normalized.includes('device not found')) {
+    return 'E_DEVICE_NOT_FOUND';
+  }
+  if (normalized.includes('permission denied') || normalized.includes('operation not permitted')) {
+    return 'E_PERMISSION_DENIED';
+  }
+  if (normalized.includes('failed') || normalized.includes('error')) {
+    return 'E_COMMAND_FAILED';
+  }
+  return 'E_UNKNOWN';
+}
+
+function buildToolAssessment(
+  toolName: string,
+  success: boolean,
+  code: RuntimeErrorCode,
+  evidence: string,
+  errorMessage?: string
+): ToolAssessment {
+  if (success) {
+    return {
+      severity: 'info',
+      cwe: 'CWE-200',
+      masvs: ['MASVS-RESILIENCE-1'],
+      evidence,
+      repro: [`执行工具 ${toolName}`],
+      fix: '当前步骤执行成功，可继续后续验证。',
+      code
+    };
+  }
+
+  const codeFixMap: Record<RuntimeErrorCode, string> = {
+    OK: '无需修复。',
+    E_TIMEOUT: '提高 timeout_ms 或拆分命令；必要时增加 retry_count。',
+    E_DEVICE_NOT_FOUND: '先执行 adb_list_devices，确保设备已连接并选择正确 device_id。',
+    E_DEVICE_OFFLINE: '重连设备并重新授权 USB 调试，然后重试。',
+    E_PERMISSION_DENIED: '检查设备端存储/调试权限，必要时切换可写目录。',
+    E_ADB_UNAVAILABLE: '安装 Android platform-tools 并配置 ADB_PATH/PATH。',
+    E_COMMAND_FAILED: '检查命令参数与设备状态，必要时先做 workflow_session_precheck。',
+    E_PRECHECK_FAILED: '先通过 workflow_session_precheck 修复基础能力后再执行。',
+    E_UNKNOWN: '查看 stderr 与 adb 日志定位根因。'
+  };
+
+  return {
+    severity: code === 'E_ADB_UNAVAILABLE' || code === 'E_DEVICE_OFFLINE' ? 'high' : 'medium',
+    cwe: 'CWE-703',
+    masvs: ['MASVS-RESILIENCE-1'],
+    evidence: `${evidence}${errorMessage ? `; error=${errorMessage}` : ''}`,
+    repro: [`执行工具 ${toolName}`, '在相同设备与参数下复现失败'],
+    fix: codeFixMap[code],
+    code
+  };
+}
+
+async function executeWithResilience<T>(
+  operationName: string,
+  execute: () => Promise<T>,
+  options: ResilienceOptions,
+  isSuccess: (data: T) => boolean,
+  getError: (data: T) => string
+): Promise<ResilientExecutionResult<T>> {
+  const start = Date.now();
+  let lastError = '';
+  let lastCode: RuntimeErrorCode = 'E_UNKNOWN';
+
+  for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
+    try {
+      const data = await withTimeout(execute(), options.timeoutMs, operationName);
+      if (isSuccess(data)) {
+        return {
+          success: true,
+          attempts: attempt,
+          durationMs: Date.now() - start,
+          code: 'OK',
+          data
+        };
+      }
+
+      lastError = getError(data) || `${operationName} 返回失败状态`;
+      lastCode = classifyRuntimeError(lastError);
+    } catch (error: any) {
+      lastError = error?.message || String(error);
+      lastCode = classifyRuntimeError(lastError);
+    }
+
+    if (attempt < options.maxAttempts) {
+      await sleep(options.retryDelayMs);
+    }
+  }
+
+  return {
+    success: false,
+    attempts: options.maxAttempts,
+    durationMs: Date.now() - start,
+    code: lastCode,
+    error: lastError
+  };
+}
+
+async function runSessionPrecheck(deviceId?: string): Promise<SessionPrecheckResult> {
+  const checks: SessionCheck[] = [];
+  const adbCommand = getEnvValue('ADB_PATH') || 'adb';
+  const adbServer = runVersionCommand(adbCommand, ['start-server']);
+
+  checks.push({
+    key: 'adb_server',
+    title: 'ADB Server',
+    status: adbServer.ok ? 'pass' : 'fail',
+    code: adbServer.ok ? 'OK' : classifyRuntimeError(adbServer.output),
+    detail: adbServer.ok ? 'ADB server 可用' : 'ADB server 启动失败',
+    evidence: adbServer.output || 'empty output',
+    fix: adbServer.ok ? '无需处理' : '检查 platform-tools 安装和本机端口占用'
+  });
+
+  const devices = await adbManager.listDevices();
+  const availableDevices = devices.filter(device => device.state === 'device');
+  const selected = deviceId
+    ? devices.find(device => device.id === deviceId)
+    : availableDevices[0];
+
+  if (!selected) {
+    checks.push({
+      key: 'device_state',
+      title: 'Device State',
+      status: 'fail',
+      code: 'E_DEVICE_NOT_FOUND',
+      detail: deviceId ? `未找到设备 ${deviceId}` : '未检测到可用设备',
+      evidence: devices.map(device => `${device.id}:${device.state}`).join(', ') || 'no devices',
+      fix: '连接设备并确保 adb devices 显示为 device'
+    });
+  } else {
+    checks.push({
+      key: 'device_state',
+      title: 'Device State',
+      status: selected.state === 'device' ? 'pass' : 'fail',
+      code: selected.state === 'device' ? 'OK' : 'E_DEVICE_OFFLINE',
+      detail: `设备 ${selected.id} 状态: ${selected.state}`,
+      evidence: JSON.stringify(selected),
+      fix: selected.state === 'device' ? '无需处理' : '在设备端重新授权 USB 调试并重连'
+    });
+  }
+
+  const targetDevice = selected?.state === 'device' ? selected.id : undefined;
+  if (!targetDevice) {
+    const skippedChecks: SessionCheck[] = [
+      {
+        key: 'storage_write',
+        title: 'Storage Write',
+        status: 'skip',
+        code: 'E_DEVICE_NOT_FOUND',
+        detail: '未执行（无可用设备）',
+        evidence: 'device unavailable',
+        fix: '先连接可用设备'
+      },
+      {
+        key: 'screenshot',
+        title: 'Screenshot',
+        status: 'skip',
+        code: 'E_DEVICE_NOT_FOUND',
+        detail: '未执行（无可用设备）',
+        evidence: 'device unavailable',
+        fix: '先连接可用设备'
+      },
+      {
+        key: 'uiautomator',
+        title: 'UIAutomator',
+        status: 'skip',
+        code: 'E_DEVICE_NOT_FOUND',
+        detail: '未执行（无可用设备）',
+        evidence: 'device unavailable',
+        fix: '先连接可用设备'
+      },
+      {
+        key: 'logcat',
+        title: 'Logcat',
+        status: 'skip',
+        code: 'E_DEVICE_NOT_FOUND',
+        detail: '未执行（无可用设备）',
+        evidence: 'device unavailable',
+        fix: '先连接可用设备'
+      }
+    ];
+    checks.push(...skippedChecks);
+  } else {
+    const storageCheckFile = `mcp_precheck_${Date.now()}.txt`;
+    const storageResult = await adbManager.runShellCommand(
+      `echo mcp_precheck > /sdcard/Download/${storageCheckFile} && ls /sdcard/Download/${storageCheckFile} && rm /sdcard/Download/${storageCheckFile}`,
+      targetDevice
+    );
+    checks.push({
+      key: 'storage_write',
+      title: 'Storage Write',
+      status: storageResult.success ? 'pass' : 'fail',
+      code: storageResult.success ? 'OK' : classifyRuntimeError(String(storageResult.stderr || storageResult.stdout || '')),
+      detail: storageResult.success ? '存储写入与删除成功' : '存储写入校验失败',
+      evidence: String(storageResult.stdout || storageResult.stderr || ''),
+      fix: storageResult.success ? '无需处理' : '检查设备存储权限与可写目录'
+    });
+
+    const screenshotResult = await adbManager.takeScreenshot(
+      `precheck-${Date.now()}.png`,
+      targetDevice,
+      resolve(process.cwd(), 'screenshots', 'precheck')
+    );
+    checks.push({
+      key: 'screenshot',
+      title: 'Screenshot',
+      status: screenshotResult.success ? 'pass' : 'fail',
+      code: screenshotResult.success ? 'OK' : classifyRuntimeError(String(screenshotResult.error || '')),
+      detail: screenshotResult.success ? '截图能力正常' : '截图能力失败',
+      evidence: screenshotResult.success ? (screenshotResult.localPath || 'captured') : (screenshotResult.error || 'unknown'),
+      fix: screenshotResult.success ? '无需处理' : '检查 screencap 权限和本地输出目录写权限'
+    });
+
+    const uiDumpFile = `mcp_ui_${Date.now()}.xml`;
+    const uiautomatorResult = await adbManager.runShellCommand(
+      `uiautomator dump /sdcard/Download/${uiDumpFile} && ls /sdcard/Download/${uiDumpFile} && rm /sdcard/Download/${uiDumpFile}`,
+      targetDevice
+    );
+    checks.push({
+      key: 'uiautomator',
+      title: 'UIAutomator',
+      status: uiautomatorResult.success ? 'pass' : 'fail',
+      code: uiautomatorResult.success ? 'OK' : classifyRuntimeError(String(uiautomatorResult.stderr || '')),
+      detail: uiautomatorResult.success ? 'uiautomator dump 可用' : 'uiautomator dump 失败',
+      evidence: String(uiautomatorResult.stdout || uiautomatorResult.stderr || ''),
+      fix: uiautomatorResult.success ? '无需处理' : '确保设备支持 uiautomator 并且界面可访问'
+    });
+
+    const logcatResult = await adbManager.runShellCommand('logcat -d -t 5', targetDevice);
+    checks.push({
+      key: 'logcat',
+      title: 'Logcat',
+      status: logcatResult.success ? 'pass' : 'fail',
+      code: logcatResult.success ? 'OK' : classifyRuntimeError(String(logcatResult.stderr || '')),
+      detail: logcatResult.success ? 'logcat 读取正常' : 'logcat 读取失败',
+      evidence: String(logcatResult.stdout || logcatResult.stderr || ''),
+      fix: logcatResult.success ? '无需处理' : '检查设备日志访问权限或系统限制'
+    });
+  }
+
+  return {
+    ok: checks.every(check => check.status !== 'fail'),
+    deviceId: targetDevice || null,
+    checks,
+    generatedAt: new Date().toISOString()
+  };
+}
+
+type EvidenceBundleResult = {
+  bundleDir: string;
+  manifestPath: string;
+  reportFiles: string[];
+  logFiles: string[];
+  screenshotFiles: string[];
+  reportSummary: {
+    totalFindings: number;
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+    info: number;
+  };
+};
+
+function writeUnifiedReports(
+  reportBaseDir: string,
+  reportBaseName: string,
+  reportFormats: ReportFormat[],
+  unifiedReport: ReturnType<typeof buildUnifiedSecurityReport>
+): string[] {
+  const generatedReports: string[] = [];
+  for (const format of reportFormats) {
+    const extension = format === 'sarif' ? 'sarif.json' : format;
+    const reportPath = join(reportBaseDir, `${reportBaseName}.${extension}`);
+    if (format === 'json') {
+      writeFileSync(reportPath, `${JSON.stringify(unifiedReport, null, 2)}\n`, 'utf8');
+    } else if (format === 'md') {
+      writeFileSync(reportPath, `${buildMarkdownReport(unifiedReport)}\n`, 'utf8');
+    } else if (format === 'sarif') {
+      writeFileSync(reportPath, `${JSON.stringify(buildSarifReport(unifiedReport), null, 2)}\n`, 'utf8');
+    }
+    generatedReports.push(reportPath);
+  }
+  return generatedReports;
+}
+
+async function exportEvidenceBundle(params: {
+  targetPath: string;
+  outputDir?: string;
+  reportName?: string;
+  reportFormats: ReportFormat[];
+  scanOptions: StaticScanOptions;
+  precheck?: SessionPrecheckResult;
+  runtimeScreenshots?: string[];
+}): Promise<EvidenceBundleResult> {
+  const bundleDir = params.outputDir
+    ? resolve(params.outputDir)
+    : resolve(process.cwd(), 'artifacts', `evidence-bundle-${Date.now()}`);
+  const reportsDir = join(bundleDir, 'reports');
+  const evidenceDir = join(bundleDir, 'evidence');
+  const screenshotsDir = join(evidenceDir, 'screenshots');
+  const logsDir = join(bundleDir, 'logs');
+  const metadataDir = join(bundleDir, 'metadata');
+
+  mkdirSync(reportsDir, { recursive: true });
+  mkdirSync(screenshotsDir, { recursive: true });
+  mkdirSync(logsDir, { recursive: true });
+  mkdirSync(metadataDir, { recursive: true });
+
+  const analyzer = new StaticAnalyzer(`bundle-${Date.now()}`);
+  const analysis = analyzer.performComprehensiveAnalysis(params.targetPath, params.scanOptions);
+  const unifiedReport = buildUnifiedSecurityReport(params.targetPath, analysis);
+
+  const formats: ReportFormat[] = params.reportFormats.length > 0 ? params.reportFormats : ['json', 'md', 'sarif'];
+  const reportBaseName = sanitizeReportName(params.reportName || `security-report-${Date.now()}`);
+  const reportFiles = writeUnifiedReports(reportsDir, reportBaseName, formats, unifiedReport);
+
+  const logFiles: string[] = [];
+  try {
+    logFiles.push(globalLogger.saveLogs('adb', 'json', `adb-${Date.now()}`, logsDir));
+  } catch {
+    // 忽略空日志场景
+  }
+  try {
+    logFiles.push(globalLogger.saveLogs('workflow', 'json', `workflow-${Date.now()}`, logsDir));
+  } catch {
+    // 忽略空日志场景
+  }
+
+  const screenshotFiles = Array.isArray(params.runtimeScreenshots) ? params.runtimeScreenshots.filter(Boolean) : [];
+
+  const manifest = {
+    schemaVersion: '1.0.0',
+    generatedAt: new Date().toISOString(),
+    targetPath: params.targetPath,
+    bundleDir,
+    scanOptions: {
+      includeThirdParty: params.scanOptions.includeThirdParty === true,
+      thirdPartyPrefixes: params.scanOptions.thirdPartyPrefixes || []
+    },
+    precheck: params.precheck || null,
+    artifacts: {
+      reports: reportFiles,
+      screenshots: screenshotFiles,
+      logs: logFiles
+    },
+    findings: unifiedReport.findings.map(finding => ({
+      id: finding.id,
+      severity: finding.severity,
+      cwe: finding.cwe,
+      masvs: finding.masvs,
+      title: finding.title,
+      evidence: {
+        codeLocation: `${finding.evidence.file}${finding.evidence.line ? `:${finding.evidence.line}` : ''}`,
+        screenshots: screenshotFiles,
+        logs: logFiles
+      },
+      repro: finding.repro,
+      fix: finding.fix
+    })),
+    summary: unifiedReport.summary
+  };
+
+  const manifestPath = join(bundleDir, 'manifest.json');
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+
+  const summaryPath = join(metadataDir, 'summary.json');
+  writeFileSync(summaryPath, `${JSON.stringify(unifiedReport.summary, null, 2)}\n`, 'utf8');
+
+  return {
+    bundleDir,
+    manifestPath,
+    reportFiles,
+    logFiles,
+    screenshotFiles,
+    reportSummary: unifiedReport.summary
+  };
+}
+
 const server = new Server(
   {
     name: 'mobile-app-testing-mcp',
@@ -256,6 +839,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: '指定设备ID（可选）',
             },
+            timeout_ms: {
+              type: 'number',
+              description: '执行超时（毫秒，默认20000）',
+              default: 20000,
+            },
+            retry_count: {
+              type: 'number',
+              description: '失败重试次数（默认1）',
+              default: 1,
+            },
+            retry_delay_ms: {
+              type: 'number',
+              description: '重试间隔（毫秒，默认800）',
+              default: 800,
+            },
           },
           required: ['package_name'],
         },
@@ -357,6 +955,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             device_id: {
               type: 'string',
               description: '指定设备ID（可选）',
+            },
+            timeout_ms: {
+              type: 'number',
+              description: '执行超时（毫秒，默认20000）',
+              default: 20000,
+            },
+            retry_count: {
+              type: 'number',
+              description: '失败重试次数（默认1）',
+              default: 1,
+            },
+            retry_delay_ms: {
+              type: 'number',
+              description: '重试间隔（毫秒，默认800）',
+              default: 800,
             },
           },
           required: ['package_name'],
@@ -462,6 +1075,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: '指定设备ID（可选）',
             },
+            timeout_ms: {
+              type: 'number',
+              description: '执行超时（毫秒，默认15000）',
+              default: 15000,
+            },
+            retry_count: {
+              type: 'number',
+              description: '失败重试次数（默认1）',
+              default: 1,
+            },
+            retry_delay_ms: {
+              type: 'number',
+              description: '重试间隔（毫秒，默认500）',
+              default: 500,
+            },
           },
           required: ['command'],
         },
@@ -485,6 +1113,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             device_id: {
               type: 'string',
               description: '指定设备ID（可选）',
+            },
+            timeout_ms: {
+              type: 'number',
+              description: '执行超时（毫秒，默认25000）',
+              default: 25000,
+            },
+            retry_count: {
+              type: 'number',
+              description: '失败重试次数（默认1）',
+              default: 1,
+            },
+            retry_delay_ms: {
+              type: 'number',
+              description: '重试间隔（毫秒，默认1000）',
+              default: 1000,
             },
           },
         },
@@ -748,6 +1391,122 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ['tool_name', 'result'],
         },
       },
+
+      {
+        name: 'workflow_session_precheck',
+        description: '执行会话预检：ADB服务、设备状态、存储写入、截图、UIAutomator、Logcat 可用性',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            device_id: {
+              type: 'string',
+              description: '指定设备ID（可选，不传则自动选择第一个可用设备）'
+            }
+          },
+          required: []
+        }
+      },
+
+      {
+        name: 'workflow_export_evidence_bundle',
+        description: '导出证据包：固定目录结构 + manifest.json + 报告（json/md/sarif）',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            target_path: {
+              type: 'string',
+              description: '扫描目标目录（通常为反编译源码目录）'
+            },
+            output_dir: {
+              type: 'string',
+              description: '证据包输出目录（默认自动生成 artifacts/evidence-bundle-*）'
+            },
+            report_name: {
+              type: 'string',
+              description: '报告文件名前缀（可选）'
+            },
+            output_formats: {
+              type: 'array',
+              items: {
+                type: 'string',
+                enum: ['json', 'md', 'sarif']
+              },
+              description: '导出格式（默认全部）'
+            },
+            include_third_party: {
+              type: 'boolean',
+              description: '是否包含第三方库目录（默认false）',
+              default: false
+            },
+            third_party_prefixes: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '第三方路径前缀（可选）'
+            }
+          },
+          required: ['target_path']
+        }
+      },
+
+      {
+        name: 'workflow_run_repro_pipeline',
+        description: '一键复现流水线：预检 + 静态扫描 + 动态留证 + 证据包导出',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            target_path: {
+              type: 'string',
+              description: '扫描目标目录（通常为反编译源码目录）'
+            },
+            package_name: {
+              type: 'string',
+              description: '可选：用于动态启动与截图的应用包名'
+            },
+            device_id: {
+              type: 'string',
+              description: '可选：指定设备ID'
+            },
+            output_dir: {
+              type: 'string',
+              description: '流水线产物目录（默认自动生成 artifacts/repro-pipeline-*）'
+            },
+            output_formats: {
+              type: 'array',
+              items: {
+                type: 'string',
+                enum: ['json', 'md', 'sarif']
+              },
+              description: '报告导出格式（默认全部）'
+            },
+            include_third_party: {
+              type: 'boolean',
+              description: '是否包含第三方库目录（默认false）',
+              default: false
+            },
+            third_party_prefixes: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '第三方路径前缀（可选）'
+            },
+            timeout_ms: {
+              type: 'number',
+              description: '动态步骤超时（毫秒，默认25000）',
+              default: 25000
+            },
+            retry_count: {
+              type: 'number',
+              description: '动态步骤失败重试次数（默认1）',
+              default: 1
+            },
+            retry_delay_ms: {
+              type: 'number',
+              description: '动态步骤重试间隔（毫秒，默认1000）',
+              default: 1000
+            }
+          },
+          required: ['target_path']
+        }
+      },
       
       // ===== AAPT APK分析工具 =====
       {
@@ -884,6 +1643,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: ['all', 'api_keys', 'passwords', 'certificates', 'database', 'cloud_keys', 'mobile_specific'],
               description: '扫描模式类型（默认: all）',
               default: 'all'
+            },
+            include_third_party: {
+              type: 'boolean',
+              description: '是否包含第三方库目录（默认false）',
+              default: false
+            },
+            third_party_prefixes: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '第三方路径前缀（可选）'
             }
           },
           required: ['target_path'],
@@ -898,6 +1667,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             target_path: {
               type: 'string',
               description: '要扫描的文件或目录路径'
+            },
+            include_third_party: {
+              type: 'boolean',
+              description: '是否包含第三方库目录（默认false）',
+              default: false
+            },
+            third_party_prefixes: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '第三方路径前缀（可选）'
             }
           },
           required: ['target_path'],
@@ -912,6 +1691,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             target_path: {
               type: 'string',
               description: '要扫描的文件或目录路径'
+            },
+            include_third_party: {
+              type: 'boolean',
+              description: '是否包含第三方库目录（默认false）',
+              default: false
+            },
+            third_party_prefixes: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '第三方路径前缀（可选）'
             }
           },
           required: ['target_path'],
@@ -942,6 +1731,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             report_name: {
               type: 'string',
               description: '可选：报告文件名前缀（不含扩展名）'
+            },
+            include_third_party: {
+              type: 'boolean',
+              description: '是否包含第三方库目录（默认false）',
+              default: false
+            },
+            third_party_prefixes: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '第三方路径前缀（可选）'
             }
           },
           required: ['target_path'],
@@ -1280,18 +2079,55 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { package_name, activity, clear_task = false, device_id } = args as {
           package_name: string; activity?: string; clear_task?: boolean; device_id?: string;
         };
-        
-        const success = clear_task 
-          ? await adbManager.startAppWithClear(package_name, activity, device_id)
-          : await adbManager.startApp(package_name, activity, device_id);
-        
+
+        const resilience = parseResilienceOptions(args as Record<string, unknown>, {
+          timeoutMs: 20000,
+          retryCount: 1,
+          retryDelayMs: 800
+        });
+
+        const execResult = await executeWithResilience(
+          'adb_start_app',
+          () => clear_task
+            ? adbManager.startAppWithClear(package_name, activity, device_id)
+            : adbManager.startApp(package_name, activity, device_id),
+          resilience,
+          result => result === true,
+          () => `应用启动失败: ${package_name}`
+        );
+
+        const assessment = buildToolAssessment(
+          'adb_start_app',
+          execResult.success,
+          execResult.code,
+          `package=${package_name}; device=${device_id || 'default'}`,
+          execResult.error
+        );
+
+        const structured = {
+          packageName: package_name,
+          activity: activity || null,
+          clearTask: clear_task,
+          deviceId: device_id || null,
+          success: execResult.success,
+          code: execResult.code,
+          attempts: execResult.attempts,
+          durationMs: execResult.durationMs,
+          timeoutMs: resilience.timeoutMs,
+          retryCount: resilience.maxAttempts - 1,
+          error: execResult.error || null,
+          assessment
+        };
+
         return {
           content: [
             {
               type: 'text',
-              text: success 
-                ? `✅ 应用启动成功: ${package_name}${activity ? ` (${activity})` : ''}`
-                : `❌ 应用启动失败: ${package_name}`,
+              text: `${execResult.success ? '✅' : '❌'} 应用启动${execResult.success ? '成功' : '失败'}: ${package_name}${activity ? ` (${activity})` : ''}\n` +
+                    `状态码: ${execResult.code}\n` +
+                    `尝试次数: ${execResult.attempts}\n` +
+                    `耗时: ${execResult.durationMs}ms\n\n` +
+                    `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
             },
           ],
         };
@@ -1374,17 +2210,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'adb_shell_command': {
         const { command, device_id } = args as { command: string; device_id?: string };
-        
-        const result = await adbManager.runShellCommand(command, device_id);
-        const stdoutText = typeof result.stdout === 'string' ? result.stdout : String(result.stdout ?? '');
-        const stderrText = typeof result.stderr === 'string' ? result.stderr : String(result.stderr ?? '');
+
+        const resilience = parseResilienceOptions(args as Record<string, unknown>, {
+          timeoutMs: 15000,
+          retryCount: 1,
+          retryDelayMs: 500
+        });
+
+        const execResult = await executeWithResilience(
+          'adb_shell_command',
+          () => adbManager.runShellCommand(command, device_id),
+          resilience,
+          result => result.success === true,
+          result => String(result.stderr || result.stdout || 'shell command failed')
+        );
+
+        const shellResult = execResult.data;
+        const stdoutText = typeof shellResult?.stdout === 'string' ? shellResult.stdout : String(shellResult?.stdout ?? '');
+        const stderrText = typeof shellResult?.stderr === 'string' ? shellResult.stderr : String(shellResult?.stderr ?? '');
+        const exitCode = typeof shellResult?.exitCode === 'number' ? shellResult.exitCode : null;
+        const assessment = buildToolAssessment(
+          'adb_shell_command',
+          execResult.success,
+          execResult.code,
+          `command=${command}; device=${device_id || 'default'}; exitCode=${exitCode ?? 'n/a'}`,
+          execResult.error || stderrText
+        );
+
         const structured = {
           command,
           deviceId: device_id || null,
-          success: result.success,
-          exitCode: result.exitCode,
+          success: execResult.success,
+          code: execResult.code,
+          attempts: execResult.attempts,
+          durationMs: execResult.durationMs,
+          timeoutMs: resilience.timeoutMs,
+          retryCount: resilience.maxAttempts - 1,
+          exitCode,
           stdout: stdoutText,
-          stderr: stderrText
+          stderr: stderrText,
+          error: execResult.error || null,
+          assessment
         };
         
         return {
@@ -1393,8 +2259,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: 'text',
               text: `🐚 Shell命令执行结果（sh -c 包装执行）\n` +
                     `命令: ${command}\n` +
-                    `状态: ${result.success ? '成功' : '失败'}\n` +
-                    `退出码: ${result.exitCode}\n\n` +
+                    `状态: ${execResult.success ? '成功' : '失败'}\n` +
+                    `状态码: ${execResult.code}\n` +
+                    `退出码: ${exitCode}\n` +
+                    `尝试次数: ${execResult.attempts}\n` +
+                    `耗时: ${execResult.durationMs}ms\n\n` +
                     `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
             },
           ],
@@ -1404,25 +2273,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ===== ADB 截屏录屏工具 =====
       case 'adb_screenshot': {
         const { filename, output_dir, device_id } = args as { filename?: string; output_dir?: string; device_id?: string };
-        
-        const result = await adbManager.takeScreenshot(filename, device_id, output_dir);
-        
-        // 记录工具执行
-        workflowManager.recordToolExecution('adb_screenshot', result);
-        
-        // 获取下一步建议
+
+        const resilience = parseResilienceOptions(args as Record<string, unknown>, {
+          timeoutMs: 25000,
+          retryCount: 1,
+          retryDelayMs: 1000
+        });
+        const execResult = await executeWithResilience(
+          'adb_screenshot',
+          () => adbManager.takeScreenshot(filename, device_id, output_dir),
+          resilience,
+          result => result.success === true,
+          result => String(result.error || 'screenshot failed')
+        );
+
+        const screenshotResult = execResult.data;
+        const assessment = buildToolAssessment(
+          'adb_screenshot',
+          execResult.success,
+          execResult.code,
+          `device=${device_id || 'default'}; output=${screenshotResult?.localPath || output_dir || 'default'}`,
+          execResult.error || screenshotResult?.error
+        );
+
+        if (screenshotResult) {
+          workflowManager.recordToolExecution('adb_screenshot', screenshotResult);
+        }
+
         const suggestions = workflowManager.getSmartSuggestions();
-        const nextSteps = suggestions.slice(0, 3).map(s => 
-          `• ${s.tool} - ${s.reason}`
-        ).join('\n');
-        
+        const nextSteps = suggestions.slice(0, 3).map(s => `• ${s.tool} - ${s.reason}`).join('\n');
+        const structured = {
+          filename: filename || null,
+          outputDir: output_dir || null,
+          deviceId: device_id || null,
+          success: execResult.success,
+          code: execResult.code,
+          attempts: execResult.attempts,
+          durationMs: execResult.durationMs,
+          timeoutMs: resilience.timeoutMs,
+          retryCount: resilience.maxAttempts - 1,
+          localPath: screenshotResult?.localPath || null,
+          devicePath: screenshotResult?.devicePath || null,
+          error: execResult.error || screenshotResult?.error || null,
+          assessment
+        };
+
         return {
           content: [
             {
               type: 'text',
-              text: result.success 
-                ? `📸 截屏成功:\n保存路径: ${result.localPath}\n\n🎯 建议下一步:\n${nextSteps}`
-                : `❌ 截屏失败:\n错误: ${result.error}\n\n💡 故障排除:\n• workflow_get_smart_suggestions - 获取问题诊断建议\n• adb_list_devices - 检查设备连接状态`,
+              text: execResult.success
+                ? `📸 截屏成功:\n保存路径: ${screenshotResult?.localPath}\n状态码: ${execResult.code}\n尝试次数: ${execResult.attempts}\n耗时: ${execResult.durationMs}ms\n\n🎯 建议下一步:\n${nextSteps}\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``
+                : `❌ 截屏失败:\n状态码: ${execResult.code}\n错误: ${execResult.error || screenshotResult?.error || 'unknown'}\n尝试次数: ${execResult.attempts}\n耗时: ${execResult.durationMs}ms\n\n💡 故障排除:\n• workflow_session_precheck - 一键预检基础能力\n• workflow_get_smart_suggestions - 获取问题诊断建议\n• adb_list_devices - 检查设备连接状态\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
             },
           ],
         };
@@ -1717,6 +2619,237 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     `您可以使用 \`workflow_get_smart_suggestions\` 获取下一步建议。`
             },
           ],
+        };
+      }
+
+      case 'workflow_session_precheck': {
+        const { device_id } = args as { device_id?: string };
+        const precheck = await runSessionPrecheck(device_id);
+        const assessment = buildToolAssessment(
+          'workflow_session_precheck',
+          precheck.ok,
+          precheck.ok ? 'OK' : 'E_PRECHECK_FAILED',
+          `device=${precheck.deviceId || 'none'}`,
+          precheck.ok ? undefined : 'precheck has failed items'
+        );
+
+        const checksText = precheck.checks
+          .map(check => `• [${check.status.toUpperCase()}] ${check.title} (${check.code}) - ${check.detail}`)
+          .join('\n');
+        const structured = {
+          ...precheck,
+          assessment
+        };
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${precheck.ok ? '✅' : '❌'} 会话预检${precheck.ok ? '通过' : '失败'}\n` +
+                    `设备: ${precheck.deviceId || '未选中'}\n\n` +
+                    `预检项:\n${checksText}\n\n` +
+                    `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``
+            }
+          ]
+        };
+      }
+
+      case 'workflow_export_evidence_bundle': {
+        const {
+          target_path,
+          output_dir,
+          report_name,
+          output_formats
+        } = args as {
+          target_path: string;
+          output_dir?: string;
+          report_name?: string;
+          output_formats?: unknown;
+        };
+
+        const selectedFormats = parseReportFormats(output_formats);
+        if (Array.isArray(output_formats) && output_formats.length > 0 && selectedFormats.length === 0) {
+          throw new Error('output_formats 仅支持 json / md / sarif');
+        }
+        const scanOptions = createStaticScanOptions(args as Record<string, unknown>);
+        const bundle = await exportEvidenceBundle({
+          targetPath: target_path,
+          outputDir: output_dir,
+          reportName: report_name,
+          reportFormats: selectedFormats,
+          scanOptions
+        });
+        const assessment = buildToolAssessment(
+          'workflow_export_evidence_bundle',
+          true,
+          'OK',
+          `bundle=${bundle.bundleDir}; reports=${bundle.reportFiles.length}`
+        );
+        const structured = {
+          bundleDir: bundle.bundleDir,
+          manifestPath: bundle.manifestPath,
+          reportFiles: bundle.reportFiles,
+          logFiles: bundle.logFiles,
+          screenshotFiles: bundle.screenshotFiles,
+          summary: bundle.reportSummary,
+          assessment
+        };
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `📦 证据包导出完成\n` +
+                    `输出目录: ${bundle.bundleDir}\n` +
+                    `manifest: ${bundle.manifestPath}\n` +
+                    `报告数量: ${bundle.reportFiles.length}\n` +
+                    `日志数量: ${bundle.logFiles.length}\n\n` +
+                    `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``
+            }
+          ]
+        };
+      }
+
+      case 'workflow_run_repro_pipeline': {
+        const {
+          target_path,
+          package_name,
+          device_id,
+          output_dir,
+          output_formats
+        } = args as {
+          target_path: string;
+          package_name?: string;
+          device_id?: string;
+          output_dir?: string;
+          output_formats?: unknown;
+        };
+
+        const pipelineDir = output_dir
+          ? resolve(output_dir)
+          : resolve(process.cwd(), 'artifacts', `repro-pipeline-${Date.now()}`);
+        const runtimeScreenshots: string[] = [];
+        const selectedFormats = parseReportFormats(output_formats);
+        if (Array.isArray(output_formats) && output_formats.length > 0 && selectedFormats.length === 0) {
+          throw new Error('output_formats 仅支持 json / md / sarif');
+        }
+        const scanOptions = createStaticScanOptions(args as Record<string, unknown>);
+        const dynamicResilience = parseResilienceOptions(args as Record<string, unknown>, {
+          timeoutMs: 25000,
+          retryCount: 1,
+          retryDelayMs: 1000
+        });
+
+        const precheck = await runSessionPrecheck(device_id);
+        const dynamicSteps: Array<Record<string, unknown>> = [];
+        let pipelineCode: RuntimeErrorCode = 'OK';
+        let pipelineError: string | undefined;
+
+        if (package_name) {
+          if (!precheck.ok || !precheck.deviceId) {
+            pipelineCode = 'E_PRECHECK_FAILED';
+            pipelineError = '预检未通过，跳过动态步骤';
+          } else {
+            const startResult = await executeWithResilience(
+              'pipeline.adb_start_app',
+              () => adbManager.startApp(package_name, undefined, precheck.deviceId || undefined),
+              dynamicResilience,
+              result => result === true,
+              () => `应用启动失败: ${package_name}`
+            );
+            dynamicSteps.push({
+              step: 'adb_start_app',
+              success: startResult.success,
+              code: startResult.code,
+              attempts: startResult.attempts,
+              durationMs: startResult.durationMs,
+              error: startResult.error || null
+            });
+
+            if (startResult.success) {
+              const screenshotResult = await executeWithResilience(
+                'pipeline.adb_screenshot',
+                () => adbManager.takeScreenshot(
+                  `pipeline-${Date.now()}.png`,
+                  precheck.deviceId || undefined,
+                  join(pipelineDir, 'evidence', 'screenshots')
+                ),
+                dynamicResilience,
+                result => result.success === true,
+                result => String(result.error || 'screenshot failed')
+              );
+              if (screenshotResult.data?.localPath) {
+                runtimeScreenshots.push(screenshotResult.data.localPath);
+              }
+              dynamicSteps.push({
+                step: 'adb_screenshot',
+                success: screenshotResult.success,
+                code: screenshotResult.code,
+                attempts: screenshotResult.attempts,
+                durationMs: screenshotResult.durationMs,
+                output: screenshotResult.data?.localPath || null,
+                error: screenshotResult.error || screenshotResult.data?.error || null
+              });
+              if (!screenshotResult.success) {
+                pipelineCode = screenshotResult.code;
+                pipelineError = screenshotResult.error || '动态截图失败';
+              }
+            } else {
+              pipelineCode = startResult.code;
+              pipelineError = startResult.error || '动态启动失败';
+            }
+          }
+        }
+
+        const bundle = await exportEvidenceBundle({
+          targetPath: target_path,
+          outputDir: pipelineDir,
+          reportName: `pipeline-report-${Date.now()}`,
+          reportFormats: selectedFormats,
+          scanOptions,
+          precheck,
+          runtimeScreenshots
+        });
+
+        const success = pipelineCode === 'OK';
+        const assessment = buildToolAssessment(
+          'workflow_run_repro_pipeline',
+          success,
+          pipelineCode,
+          `pipelineDir=${pipelineDir}; findings=${bundle.reportSummary.totalFindings}`,
+          pipelineError
+        );
+
+        const structured = {
+          success,
+          code: pipelineCode,
+          error: pipelineError || null,
+          precheck,
+          dynamicSteps,
+          artifacts: {
+            bundleDir: bundle.bundleDir,
+            manifestPath: bundle.manifestPath,
+            reportFiles: bundle.reportFiles,
+            logFiles: bundle.logFiles,
+            screenshotFiles: bundle.screenshotFiles
+          },
+          summary: bundle.reportSummary,
+          assessment
+        };
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${success ? '✅' : '⚠️'} 复现流水线执行完成\n` +
+                    `状态码: ${pipelineCode}\n` +
+                    `产物目录: ${bundle.bundleDir}\n` +
+                    `manifest: ${bundle.manifestPath}\n` +
+                    `问题总数: ${bundle.reportSummary.totalFindings}\n` +
+                    `${pipelineError ? `错误: ${pipelineError}\n` : ''}\n` +
+                    `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``
+            }
+          ]
         };
       }
 
@@ -2115,13 +3248,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           target_path: string;
           pattern_type?: string;
         };
+        const scanOptions = createStaticScanOptions(args as Record<string, unknown>);
 
         try {
           console.log(`[MCP] 开始扫描硬编码敏感信息: ${target_path}`);
+          const scanStartedAt = Date.now();
           
           const sessionId = `static-${Date.now()}`;
           const analyzer = new StaticAnalyzer(sessionId);
-          const findings = analyzer.scanHardcodedSecrets(target_path, pattern_type);
+          const findings = analyzer.scanHardcodedSecrets(target_path, pattern_type, scanOptions);
+          const businessFindings = findings.filter(finding => !isThirdPartyFilePath(finding.file, scanOptions));
+          const thirdPartyFindings = findings.filter(finding => isThirdPartyFilePath(finding.file, scanOptions));
 
           const severityCounts = findings.reduce((acc, finding) => {
             acc[finding.severity] = (acc[finding.severity] || 0) + 1;
@@ -2132,6 +3269,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           resultText += `📊 扫描统计:\n`;
           resultText += `• 扫描目标: ${target_path}\n`;
           resultText += `• 扫描模式: ${pattern_type}\n`;
+          resultText += `• 扫描文件: ${analyzer.getScannedFilesCount()}个\n`;
+          resultText += `• 跳过第三方文件: ${analyzer.getSkippedThirdPartyFilesCount()}个\n`;
+          resultText += `• 业务代码问题: ${businessFindings.length}个\n`;
+          resultText += `• 第三方代码问题: ${thirdPartyFindings.length}个\n`;
           resultText += `• 发现问题: ${findings.length}个\n`;
           
           if (findings.length > 0) {
@@ -2172,15 +3313,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resultText += `\n✅ 未发现硬编码敏感信息，安全状态良好！\n\n`;
           }
 
-          resultText += `💡 安全建议:\n`;
-          resultText += `• 使用环境变量存储敏感配置\n`;
-          resultText += `• 采用配置文件管理密钥\n`;
-          resultText += `• 实施密钥管理最佳实践\n`;
-          resultText += `• 定期进行安全代码审计`;
+	          resultText += `💡 安全建议:\n`;
+	          resultText += `• 使用环境变量存储敏感配置\n`;
+	          resultText += `• 采用配置文件管理密钥\n`;
+	          resultText += `• 实施密钥管理最佳实践\n`;
+	          resultText += `• 定期进行安全代码审计`;
 
-          return {
-            content: [{ type: 'text', text: resultText }],
-          };
+	          const unifiedReport = buildUnifiedReportFromFindings({
+	            targetPath: target_path,
+	            findings,
+	            scannedFiles: analyzer.getScannedFilesCount(),
+	            skippedThirdPartyFiles: analyzer.getSkippedThirdPartyFilesCount(),
+	            scanTimeMs: Date.now() - scanStartedAt,
+	            scanOptions
+	          });
+	          const assessment = buildToolAssessment(
+	            'static_scan_secrets',
+	            true,
+	            'OK',
+	            `target=${target_path}; findings=${findings.length}`
+	          );
+	          const structured = {
+	            success: true,
+	            code: 'OK',
+	            targetPath: target_path,
+	            summary: unifiedReport.summary,
+	            scopeSummary: buildScopeSummary(findings, scanOptions),
+	            scannedFiles: analyzer.getScannedFilesCount(),
+	            skippedThirdPartyFiles: analyzer.getSkippedThirdPartyFilesCount(),
+	            reportModelFields: ['severity', 'cwe', 'masvs', 'evidence', 'repro', 'impact', 'fix'],
+	            findings: unifiedReport.findings.map(finding => ({
+	              id: finding.id,
+	              severity: finding.severity,
+	              cwe: finding.cwe,
+	              masvs: finding.masvs,
+	              evidence: finding.evidence,
+	              repro: finding.repro,
+	              impact: finding.impact,
+	              fix: finding.fix
+	            })),
+	            assessment
+	          };
+	          resultText += `\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``;
+
+	          return {
+	            content: [{ type: 'text', text: resultText }],
+	          };
 
         } catch (error: any) {
           return {
@@ -2204,13 +3382,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'static_scan_debug_leaks': {
         const { target_path } = args as { target_path: string };
+        const scanOptions = createStaticScanOptions(args as Record<string, unknown>);
 
         try {
           console.log(`[MCP] 开始扫描调试信息泄露: ${target_path}`);
+          const scanStartedAt = Date.now();
           
           const sessionId = `static-${Date.now()}`;
           const analyzer = new StaticAnalyzer(sessionId);
-          const findings = analyzer.scanDebugInfoLeakage(target_path);
+          const findings = analyzer.scanDebugInfoLeakage(target_path, scanOptions);
+          const businessFindings = findings.filter(finding => !isThirdPartyFilePath(finding.file, scanOptions));
+          const thirdPartyFindings = findings.filter(finding => isThirdPartyFilePath(finding.file, scanOptions));
 
           const severityCounts = findings.reduce((acc, finding) => {
             acc[finding.severity] = (acc[finding.severity] || 0) + 1;
@@ -2220,6 +3402,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           let resultText = `🐛 调试信息泄露扫描结果\n\n`;
           resultText += `📊 扫描统计:\n`;
           resultText += `• 扫描目标: ${target_path}\n`;
+          resultText += `• 扫描文件: ${analyzer.getScannedFilesCount()}个\n`;
+          resultText += `• 跳过第三方文件: ${analyzer.getSkippedThirdPartyFilesCount()}个\n`;
+          resultText += `• 业务代码问题: ${businessFindings.length}个\n`;
+          resultText += `• 第三方代码问题: ${thirdPartyFindings.length}个\n`;
           resultText += `• 发现问题: ${findings.length}个\n`;
           
           if (findings.length > 0) {
@@ -2259,15 +3445,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resultText += `\n✅ 未发现调试信息泄露问题，代码清理良好！\n\n`;
           }
 
-          resultText += `🛡️ 安全建议:\n`;
-          resultText += `• 生产版本移除所有调试日志\n`;
-          resultText += `• 使用可控制的日志级别\n`;
-          resultText += `• 避免在日志中输出敏感信息\n`;
-          resultText += `• 定期清理代码注释和调试代码`;
+	          resultText += `🛡️ 安全建议:\n`;
+	          resultText += `• 生产版本移除所有调试日志\n`;
+	          resultText += `• 使用可控制的日志级别\n`;
+	          resultText += `• 避免在日志中输出敏感信息\n`;
+	          resultText += `• 定期清理代码注释和调试代码`;
 
-          return {
-            content: [{ type: 'text', text: resultText }],
-          };
+	          const unifiedReport = buildUnifiedReportFromFindings({
+	            targetPath: target_path,
+	            findings,
+	            scannedFiles: analyzer.getScannedFilesCount(),
+	            skippedThirdPartyFiles: analyzer.getSkippedThirdPartyFilesCount(),
+	            scanTimeMs: Date.now() - scanStartedAt,
+	            scanOptions
+	          });
+	          const assessment = buildToolAssessment(
+	            'static_scan_debug_leaks',
+	            true,
+	            'OK',
+	            `target=${target_path}; findings=${findings.length}`
+	          );
+	          const structured = {
+	            success: true,
+	            code: 'OK',
+	            targetPath: target_path,
+	            summary: unifiedReport.summary,
+	            scopeSummary: buildScopeSummary(findings, scanOptions),
+	            scannedFiles: analyzer.getScannedFilesCount(),
+	            skippedThirdPartyFiles: analyzer.getSkippedThirdPartyFilesCount(),
+	            reportModelFields: ['severity', 'cwe', 'masvs', 'evidence', 'repro', 'impact', 'fix'],
+	            findings: unifiedReport.findings.map(finding => ({
+	              id: finding.id,
+	              severity: finding.severity,
+	              cwe: finding.cwe,
+	              masvs: finding.masvs,
+	              evidence: finding.evidence,
+	              repro: finding.repro,
+	              impact: finding.impact,
+	              fix: finding.fix
+	            })),
+	            assessment
+	          };
+	          resultText += `\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``;
+
+	          return {
+	            content: [{ type: 'text', text: resultText }],
+	          };
 
         } catch (error: any) {
           return {
@@ -2283,13 +3506,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'static_scan_weak_crypto': {
         const { target_path } = args as { target_path: string };
+        const scanOptions = createStaticScanOptions(args as Record<string, unknown>);
 
         try {
           console.log(`[MCP] 开始扫描弱加密算法: ${target_path}`);
+          const scanStartedAt = Date.now();
           
           const sessionId = `static-${Date.now()}`;
           const analyzer = new StaticAnalyzer(sessionId);
-          const findings = analyzer.scanWeakCrypto(target_path);
+          const findings = analyzer.scanWeakCrypto(target_path, scanOptions);
+          const businessFindings = findings.filter(finding => !isThirdPartyFilePath(finding.file, scanOptions));
+          const thirdPartyFindings = findings.filter(finding => isThirdPartyFilePath(finding.file, scanOptions));
 
           const severityCounts = findings.reduce((acc, finding) => {
             acc[finding.severity] = (acc[finding.severity] || 0) + 1;
@@ -2299,6 +3526,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           let resultText = `🔒 弱加密算法检测结果\n\n`;
           resultText += `📊 扫描统计:\n`;
           resultText += `• 扫描目标: ${target_path}\n`;
+          resultText += `• 扫描文件: ${analyzer.getScannedFilesCount()}个\n`;
+          resultText += `• 跳过第三方文件: ${analyzer.getSkippedThirdPartyFilesCount()}个\n`;
+          resultText += `• 业务代码问题: ${businessFindings.length}个\n`;
+          resultText += `• 第三方代码问题: ${thirdPartyFindings.length}个\n`;
           resultText += `• 发现问题: ${findings.length}个\n`;
           
           if (findings.length > 0) {
@@ -2338,15 +3569,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resultText += `\n✅ 未发现弱加密算法使用，加密实现安全！\n\n`;
           }
 
-          resultText += `🔐 安全建议:\n`;
-          resultText += `• 使用AES-256-GCM进行对称加密\n`;
-          resultText += `• 使用RSA-2048或ECDSA进行非对称加密\n`;
-          resultText += `• 使用SHA-256或更强的哈希算法\n`;
-          resultText += `• 采用SecureRandom生成加密随机数`;
+	          resultText += `🔐 安全建议:\n`;
+	          resultText += `• 使用AES-256-GCM进行对称加密\n`;
+	          resultText += `• 使用RSA-2048或ECDSA进行非对称加密\n`;
+	          resultText += `• 使用SHA-256或更强的哈希算法\n`;
+	          resultText += `• 采用SecureRandom生成加密随机数`;
 
-          return {
-            content: [{ type: 'text', text: resultText }],
-          };
+	          const unifiedReport = buildUnifiedReportFromFindings({
+	            targetPath: target_path,
+	            findings,
+	            scannedFiles: analyzer.getScannedFilesCount(),
+	            skippedThirdPartyFiles: analyzer.getSkippedThirdPartyFilesCount(),
+	            scanTimeMs: Date.now() - scanStartedAt,
+	            scanOptions
+	          });
+	          const assessment = buildToolAssessment(
+	            'static_scan_weak_crypto',
+	            true,
+	            'OK',
+	            `target=${target_path}; findings=${findings.length}`
+	          );
+	          const structured = {
+	            success: true,
+	            code: 'OK',
+	            targetPath: target_path,
+	            summary: unifiedReport.summary,
+	            scopeSummary: buildScopeSummary(findings, scanOptions),
+	            scannedFiles: analyzer.getScannedFilesCount(),
+	            skippedThirdPartyFiles: analyzer.getSkippedThirdPartyFilesCount(),
+	            reportModelFields: ['severity', 'cwe', 'masvs', 'evidence', 'repro', 'impact', 'fix'],
+	            findings: unifiedReport.findings.map(finding => ({
+	              id: finding.id,
+	              severity: finding.severity,
+	              cwe: finding.cwe,
+	              masvs: finding.masvs,
+	              evidence: finding.evidence,
+	              repro: finding.repro,
+	              impact: finding.impact,
+	              fix: finding.fix
+	            })),
+	            assessment
+	          };
+	          resultText += `\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``;
+
+	          return {
+	            content: [{ type: 'text', text: resultText }],
+	          };
 
         } catch (error: any) {
           return {
@@ -2378,7 +3646,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           
           const sessionId = `static-${Date.now()}`;
           const analyzer = new StaticAnalyzer(sessionId);
-          const result = analyzer.performComprehensiveAnalysis(target_path);
+          const scanOptions = createStaticScanOptions(args as Record<string, unknown>);
+          const result = analyzer.performComprehensiveAnalysis(target_path, scanOptions);
           const selectedFormats = parseReportFormats(output_formats);
           if (Array.isArray(output_formats) && output_formats.length > 0 && selectedFormats.length === 0) {
             throw new Error('output_formats 仅支持 json / md / sarif');
@@ -2391,20 +3660,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             mkdirSync(reportBaseDir, { recursive: true });
 
             const baseName = sanitizeReportName(report_name || `${basename(target_path)}-${Date.now()}`);
-            for (const format of selectedFormats) {
-              const extension = format === 'sarif' ? 'sarif.json' : format;
-              const reportPath = join(reportBaseDir, `${baseName}.${extension}`);
-
-              if (format === 'json') {
-                writeFileSync(reportPath, `${JSON.stringify(unifiedReport, null, 2)}\n`, 'utf8');
-              } else if (format === 'md') {
-                writeFileSync(reportPath, `${buildMarkdownReport(unifiedReport)}\n`, 'utf8');
-              } else if (format === 'sarif') {
-                writeFileSync(reportPath, `${JSON.stringify(buildSarifReport(unifiedReport), null, 2)}\n`, 'utf8');
-              }
-
-              generatedReports.push(reportPath);
-            }
+            generatedReports.push(...writeUnifiedReports(reportBaseDir, baseName, selectedFormats, unifiedReport));
           }
 
           let resultText = `📊 全面静态安全分析报告\n\n`;
@@ -2413,6 +3669,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           resultText += `🎯 执行摘要:\n`;
           resultText += `• 扫描目标: ${target_path}\n`;
           resultText += `• 扫描文件: ${result.scannedFiles}个\n`;
+          resultText += `• 跳过第三方文件: ${result.skippedThirdPartyFiles}个\n`;
+          resultText += `• 业务代码问题: ${result.scopeSummary.businessFindings}个\n`;
+          resultText += `• 第三方代码问题: ${result.scopeSummary.thirdPartyFindings}个\n`;
           resultText += `• 扫描耗时: ${result.scanTime}ms\n`;
           resultText += `• 发现问题: ${result.summary.totalFindings}个\n\n`;
 
@@ -2423,6 +3682,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (result.summary.medium > 0) resultText += `🟡 中危: ${result.summary.medium}个\n`;
           if (result.summary.low > 0) resultText += `🔵 低危: ${result.summary.low}个\n`;
           if (result.summary.info > 0) resultText += `ℹ️ 信息: ${result.summary.info}个\n`;
+          resultText += `• 业务代码高危(critical/high): ${result.scopeSummary.businessHighRisk}个\n`;
+          resultText += `• 第三方代码高危(critical/high): ${result.scopeSummary.thirdPartyHighRisk}个\n`;
 
           // 风险评级
           let riskLevel = '🟢 低风险';
@@ -2497,6 +3758,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
 
           resultText += `\n📄 报告生成时间: ${new Date().toISOString()}`;
+          const assessment = buildToolAssessment(
+            'static_comprehensive_analysis',
+            true,
+            'OK',
+            `target=${target_path}; findings=${result.summary.totalFindings}`
+          );
+          const structured = {
+            success: true,
+            code: 'OK',
+            targetPath: target_path,
+            summary: result.summary,
+            scopeSummary: result.scopeSummary,
+            scannedFiles: result.scannedFiles,
+            skippedThirdPartyFiles: result.skippedThirdPartyFiles,
+            reportFiles: generatedReports,
+            reportModelFields: ['severity', 'cwe', 'masvs', 'evidence', 'repro', 'impact', 'fix'],
+            assessment
+          };
+          resultText += `\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``;
 
           return {
             content: [{ type: 'text', text: resultText }],

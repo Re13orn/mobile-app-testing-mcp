@@ -22,9 +22,16 @@ export interface StaticAnalysisResult {
     low: number;
     info: number;
   };
+  scopeSummary: {
+    businessFindings: number;
+    thirdPartyFindings: number;
+    businessHighRisk: number;
+    thirdPartyHighRisk: number;
+  };
   findings: SecurityFinding[];
   scanTime: number;
   scannedFiles: number;
+  skippedThirdPartyFiles: number;
 }
 
 type LiteralConstantKind = 'hex' | 'base64' | 'plain' | 'bytes';
@@ -35,9 +42,25 @@ interface LiteralConstantInfo {
   kind: LiteralConstantKind;
 }
 
+export interface StaticScanOptions {
+  includeThirdParty?: boolean;
+  thirdPartyPrefixes?: string[];
+}
+
 export class StaticAnalyzer {
   private sessionId: string;
   private scannedFiles: number = 0;
+  private skippedThirdPartyFiles: number = 0;
+  private readonly defaultThirdPartyPrefixes: string[] = [
+    '/androidx/',
+    '/android/support/',
+    '/support/',
+    '/com/google/android/material/',
+    '/kotlin/',
+    '/kotlinx/',
+    '/okhttp3/',
+    '/retrofit2/'
+  ];
   
   constructor(sessionId: string) {
     this.sessionId = sessionId;
@@ -52,10 +75,18 @@ export class StaticAnalyzer {
     });
   }
 
+  getScannedFilesCount(): number {
+    return this.scannedFiles;
+  }
+
+  getSkippedThirdPartyFilesCount(): number {
+    return this.skippedThirdPartyFiles;
+  }
+
   // 递归扫描目录中的所有代码文件
-  private scanDirectory(dirPath: string): string[] {
+  private scanDirectory(dirPath: string, options: StaticScanOptions = {}): string[] {
     const files: string[] = [];
-    const codeExtensions = ['.java', '.kt', '.xml', '.js', '.json', '.properties'];
+    const codeExtensions = ['.java', '.kt', '.xml', '.js', '.json', '.properties', '.c', '.cc', '.cpp', '.h', '.hpp'];
     
     try {
       const items = readdirSync(dirPath);
@@ -67,11 +98,15 @@ export class StaticAnalyzer {
         if (stat.isDirectory()) {
           // 跳过一些无关目录
           if (!['node_modules', '.git', 'build', 'gradle'].includes(item)) {
-            files.push(...this.scanDirectory(itemPath));
+            files.push(...this.scanDirectory(itemPath, options));
           }
         } else if (stat.isFile()) {
           const ext = extname(item).toLowerCase();
           if (codeExtensions.includes(ext)) {
+            if (this.shouldSkipThirdParty(itemPath, options)) {
+              this.skippedThirdPartyFiles += 1;
+              continue;
+            }
             files.push(itemPath);
           }
         }
@@ -81,6 +116,45 @@ export class StaticAnalyzer {
     }
     
     return files;
+  }
+
+  private normalizePathForMatch(filePath: string): string {
+    return filePath.replace(/\\/g, '/').toLowerCase();
+  }
+
+  private getThirdPartyPrefixes(options: StaticScanOptions = {}): string[] {
+    if (Array.isArray(options.thirdPartyPrefixes) && options.thirdPartyPrefixes.length > 0) {
+      return options.thirdPartyPrefixes.map(prefix => this.normalizePathForMatch(prefix));
+    }
+    return this.defaultThirdPartyPrefixes;
+  }
+
+  private isThirdPartyPath(filePath: string, options: StaticScanOptions = {}): boolean {
+    const normalized = this.normalizePathForMatch(filePath);
+    return this.getThirdPartyPrefixes(options).some(prefix => normalized.includes(prefix));
+  }
+
+  private shouldSkipThirdParty(filePath: string, options: StaticScanOptions = {}): boolean {
+    if (options.includeThirdParty) {
+      return false;
+    }
+    return this.isThirdPartyPath(filePath, options);
+  }
+
+  private resolveFilesToScan(targetPath: string, options: StaticScanOptions = {}): string[] {
+    if (!existsSync(targetPath)) {
+      return [targetPath];
+    }
+
+    if (statSync(targetPath).isDirectory()) {
+      return this.scanDirectory(targetPath, options);
+    }
+
+    if (this.shouldSkipThirdParty(targetPath, options)) {
+      this.skippedThirdPartyFiles += 1;
+      return [];
+    }
+    return [targetPath];
   }
 
   // 读取文件内容并按行分割
@@ -95,8 +169,9 @@ export class StaticAnalyzer {
   }
 
   // 硬编码敏感信息扫描
-  scanHardcodedSecrets(targetPath: string, patternType: string = 'all'): SecurityFinding[] {
+  scanHardcodedSecrets(targetPath: string, patternType: string = 'all', options: StaticScanOptions = {}): SecurityFinding[] {
     const findings: SecurityFinding[] = [];
+    this.skippedThirdPartyFiles = 0;
     
     // 定义敏感信息模式
     const patterns = {
@@ -148,10 +223,7 @@ export class StaticAnalyzer {
     });
 
     // 获取要扫描的文件列表
-    const filesToScan = existsSync(targetPath) && statSync(targetPath).isDirectory() 
-      ? this.scanDirectory(targetPath)
-      : [targetPath];
-
+    const filesToScan = this.resolveFilesToScan(targetPath, options);
     this.scannedFiles = filesToScan.length;
 
     // 扫描每个文件
@@ -191,8 +263,9 @@ export class StaticAnalyzer {
   }
 
   // 调试信息泄露扫描
-  scanDebugInfoLeakage(targetPath: string): SecurityFinding[] {
+  scanDebugInfoLeakage(targetPath: string, options: StaticScanOptions = {}): SecurityFinding[] {
     const findings: SecurityFinding[] = [];
+    this.skippedThirdPartyFiles = 0;
 
     const debugPatterns = [
       { name: 'Android Log调用', pattern: /Log\.[dviwe]\s*\([^)]*\)/, severity: 'medium' as const, risk: '可能在生产环境中泄露敏感信息' },
@@ -210,9 +283,8 @@ export class StaticAnalyzer {
     });
 
     // 获取要扫描的文件列表
-    const filesToScan = existsSync(targetPath) && statSync(targetPath).isDirectory() 
-      ? this.scanDirectory(targetPath)
-      : [targetPath];
+    const filesToScan = this.resolveFilesToScan(targetPath, options);
+    this.scannedFiles = filesToScan.length;
 
     // 扫描每个文件
     for (const filePath of filesToScan) {
@@ -251,8 +323,9 @@ export class StaticAnalyzer {
   }
 
   // 弱加密算法检测
-  scanWeakCrypto(targetPath: string): SecurityFinding[] {
+  scanWeakCrypto(targetPath: string, options: StaticScanOptions = {}): SecurityFinding[] {
     const findings: SecurityFinding[] = [];
+    this.skippedThirdPartyFiles = 0;
 
     const weakCryptoPatterns = [
       { name: 'MD5哈希算法', pattern: /MessageDigest\.getInstance\s*\(\s*['"](MD5|md5)['"]\s*\)/, severity: 'high' as const, risk: 'MD5已被证明不安全，容易被碰撞攻击' },
@@ -275,9 +348,8 @@ export class StaticAnalyzer {
     });
 
     // 获取要扫描的文件列表
-    const filesToScan = existsSync(targetPath) && statSync(targetPath).isDirectory() 
-      ? this.scanDirectory(targetPath)
-      : [targetPath];
+    const filesToScan = this.resolveFilesToScan(targetPath, options);
+    this.scannedFiles = filesToScan.length;
 
     // 扫描每个文件
     for (const filePath of filesToScan) {
@@ -317,6 +389,19 @@ export class StaticAnalyzer {
             line: lineIndex + 1,
             code: line.trim(),
             recommendation: this.getCryptoRecommendation('硬编码加密密钥')
+          });
+        }
+
+        if (this.detectNativeCredentialComparison(line)) {
+          findings.push({
+            type: 'sensitive_data',
+            severity: 'high',
+            title: '发现Native口令比较模式',
+            description: '检测到 native 层使用 strcmp/strncmp/memcmp 进行口令或secret比较，容易被逆向定位与绕过',
+            file: filePath,
+            line: lineIndex + 1,
+            code: line.trim(),
+            recommendation: this.getCryptoRecommendation('Native口令比较模式')
           });
         }
       }
@@ -515,6 +600,17 @@ export class StaticAnalyzer {
     return fallback;
   }
 
+  private detectNativeCredentialComparison(line: string): boolean {
+    const nativeComparePattern = /\b(?:strcmp|strncmp|memcmp)\s*\(/i;
+    if (!nativeComparePattern.test(line)) {
+      return false;
+    }
+
+    const hasSensitiveHint = /(password|passwd|secret|token|pin|auth|verify|check)/i.test(line);
+    const hasLiteralSecret = /["'][^"']{4,}["']/.test(line);
+    return hasSensitiveHint || hasLiteralSecret;
+  }
+
   private getCryptoRecommendation(cryptoType: string): string {
     const recommendations: Record<string, string> = {
       'MD5哈希算法': '使用SHA-256或SHA-3代替MD5',
@@ -529,15 +625,18 @@ export class StaticAnalyzer {
       'Math.random使用': '在安全场景中使用SecureRandom代替Math.random',
       '固定IV使用': '为每次加密生成随机IV',
       'Base64加密误用': 'Base64仅用于编码，敏感数据需使用真正的加密算法如AES',
-      '硬编码加密密钥': '密钥不得硬编码在客户端，建议使用Android Keystore并由服务端下发短期会话密钥'
+      '硬编码加密密钥': '密钥不得硬编码在客户端，建议使用Android Keystore并由服务端下发短期会话密钥',
+      'Native口令比较模式': '避免在 native 层直接比较明文口令；将关键校验移至服务端并增加完整性校验'
     };
     
     return recommendations[cryptoType] || '遵循最新的加密算法安全标准';
   }
 
   // 综合静态分析
-  performComprehensiveAnalysis(targetPath: string): StaticAnalysisResult {
+  performComprehensiveAnalysis(targetPath: string, options: StaticScanOptions = {}): StaticAnalysisResult {
     const startTime = Date.now();
+    this.skippedThirdPartyFiles = 0;
+    this.scannedFiles = 0;
     
     this.log('performComprehensiveAnalysis', { 
       message: `开始综合静态分析: ${targetPath}` 
@@ -545,9 +644,9 @@ export class StaticAnalyzer {
 
     // 执行所有扫描
     const allFindings: SecurityFinding[] = [
-      ...this.scanHardcodedSecrets(targetPath),
-      ...this.scanDebugInfoLeakage(targetPath),
-      ...this.scanWeakCrypto(targetPath)
+      ...this.scanHardcodedSecrets(targetPath, 'all', options),
+      ...this.scanDebugInfoLeakage(targetPath, options),
+      ...this.scanWeakCrypto(targetPath, options)
     ];
 
     // 统计结果
@@ -560,23 +659,38 @@ export class StaticAnalyzer {
       info: allFindings.filter(f => f.severity === 'info').length,
     };
 
+    const scopeSummary = {
+      businessFindings: allFindings.filter(f => !this.isThirdPartyPath(f.file, options)).length,
+      thirdPartyFindings: allFindings.filter(f => this.isThirdPartyPath(f.file, options)).length,
+      businessHighRisk: allFindings.filter(
+        f => !this.isThirdPartyPath(f.file, options) && (f.severity === 'critical' || f.severity === 'high')
+      ).length,
+      thirdPartyHighRisk: allFindings.filter(
+        f => this.isThirdPartyPath(f.file, options) && (f.severity === 'critical' || f.severity === 'high')
+      ).length
+    };
+
     const scanTime = Date.now() - startTime;
 
     const result: StaticAnalysisResult = {
       summary,
+      scopeSummary,
       findings: allFindings.sort((a, b) => {
         const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
         return severityOrder[a.severity] - severityOrder[b.severity];
       }),
       scanTime,
-      scannedFiles: this.scannedFiles
+      scannedFiles: this.scannedFiles,
+      skippedThirdPartyFiles: this.skippedThirdPartyFiles
     };
 
     this.log('performComprehensiveAnalysis', {
       message: `静态分析完成`,
       summary,
+      scopeSummary,
       scanTime: `${scanTime}ms`,
-      scannedFiles: this.scannedFiles
+      scannedFiles: this.scannedFiles,
+      skippedThirdPartyFiles: this.skippedThirdPartyFiles
     });
 
     return result;

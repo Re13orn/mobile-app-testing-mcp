@@ -15,6 +15,7 @@
 - 支持 `.env`、Android SDK 路径、系统 PATH 多层回退
 - 内置健康检查链路：`check` + `smoke` + `verify`
 - 综合静态分析可直接导出统一审计报告（`json` / `md` / `sarif`）
+- 新增会话预检与一键复现流水线（含证据包 `manifest.json`）
 
 ## 📌 能力边界
 
@@ -123,13 +124,13 @@ npm run dev      # 构建后启动（同 start）
 
 ## 🧰 工具能力清单
 
-当前总计 `40` 个工具：
+当前总计 `43` 个工具：
 
 - ADB 工具 `22`：设备、应用、文件、输入模拟、截屏录屏
 - AAPT 工具 `4`：badging、permissions、xmltree、完整分析
 - JADX 工具 `3`：反编译、输出信息、APK 验证
 - 静态分析工具 `4`：secrets/debug/weak-crypto/comprehensive（含统一报告导出）
-- 工作流工具 `6`：模板、上下文、智能建议、执行记录
+- 工作流工具 `9`：模板、上下文、智能建议、执行记录、会话预检、证据包导出、一键复现流水线
 - 文件工具 `1`：`sha256` 指纹
 
 ## 💡 使用示例
@@ -141,12 +142,24 @@ npm run dev      # 构建后启动（同 start）
 反编译这个 APK 并输出关键目录：/path/to/app.apk
 对当前连接设备截图并保存到默认目录
 对反编译目录做全面静态分析，并导出 json/md/sarif 报告到 /tmp/reports
+先做会话预检：workflow_session_precheck
+执行一键复现流水线并导出证据包：workflow_run_repro_pipeline
 ```
 
 `static_comprehensive_analysis` 支持可选参数：
 - `output_formats`: `["json","md","sarif"]` 中的任意组合
 - `output_dir`: 报告输出目录（默认 `./reports`）
 - `report_name`: 报告文件名前缀
+- `include_third_party`: 是否包含第三方库目录（默认 `false`）
+- `third_party_prefixes`: 自定义第三方路径前缀
+
+`static_scan_secrets` / `static_scan_debug_leaks` / `static_scan_weak_crypto` / `static_comprehensive_analysis` 均输出统一字段模型：
+- `severity` / `cwe` / `masvs` / `evidence` / `repro` / `impact` / `fix`
+
+`adb_start_app` / `adb_screenshot` / `adb_shell_command` 支持稳定性参数：
+- `timeout_ms`: 超时控制
+- `retry_count`: 重试次数
+- `retry_delay_ms`: 重试间隔
 
 ## 📚 Prompt 示例
 
