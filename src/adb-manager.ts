@@ -1,4 +1,4 @@
-import { spawn, exec } from 'child_process';
+import { spawn, exec, spawnSync } from 'child_process';
 import { promisify } from 'util';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync, statSync, readFileSync } from 'fs';
 import { join, dirname, basename } from 'path';
@@ -69,8 +69,62 @@ export interface InputResult {
   error?: string;
 }
 
+export interface EmulatorRuntimeInfo {
+  id: string;
+  state: ADBDevice['state'];
+  model?: string;
+}
+
+export interface EmulatorCatalogResult {
+  emulatorPath: string | null;
+  availableAvds: string[];
+  runningEmulators: EmulatorRuntimeInfo[];
+  error?: string;
+}
+
+export interface EmulatorStartOptions {
+  avdName: string;
+  writableSystem?: boolean;
+  noSnapshot?: boolean;
+  selinux?: string;
+  wifiTap?: string;
+  dnsServer?: string;
+  extraArgs?: string[];
+  waitForReady?: boolean;
+  waitForBootCompleted?: boolean;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
+export interface EmulatorStartResult {
+  success: boolean;
+  avdName: string;
+  launched: boolean;
+  pid?: number;
+  emulatorPath?: string | null;
+  args?: string[];
+  command?: string;
+  emulatorId?: string;
+  ready?: boolean;
+  bootCompleted?: boolean;
+  waitForReady?: boolean;
+  waitForBootCompleted?: boolean;
+  waitedMs?: number;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  error?: string;
+}
+
+export interface EmulatorStopResult {
+  success: boolean;
+  emulatorId?: string;
+  candidates?: string[];
+  error?: string;
+}
+
 export class ADBManager {
   private adbPath: string;
+  private emulatorPath: string | null;
   private currentDeviceId?: string;
   private screenshotDir: string;
   private recordingDir: string;
@@ -80,6 +134,7 @@ export class ADBManager {
     const projectRoot = getProjectRoot();
 
     this.adbPath = adbPath || getEnvValue('ADB_PATH') || 'adb';
+    this.emulatorPath = this.detectEmulatorPath();
     this.screenshotDir = getEnvValue('SCREENSHOTS_DIR') || join(projectRoot, 'screenshots');
     this.recordingDir = getEnvValue('RECORDINGS_DIR') || join(projectRoot, 'recordings');
     
@@ -134,6 +189,91 @@ export class ADBManager {
     }
     
     throw new Error('所有备用目录都无法使用，截屏功能不可用');
+  }
+
+  private canRunHostCommand(command: string, args: string[]): boolean {
+    try {
+      const result = spawnSync(command, args, { shell: false, stdio: 'ignore' });
+      return result.status === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private detectEmulatorPath(): string | null {
+    const emulatorFromEnv = getEnvValue('EMULATOR_PATH');
+    const sdkPath = getEnvValue('ANDROID_HOME', 'ANDROID_SDK_ROOT');
+    const emulatorBin = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
+
+    const candidates = [
+      emulatorFromEnv,
+      sdkPath ? join(sdkPath, 'emulator', emulatorBin) : null,
+      '/opt/homebrew/bin/emulator',
+      '/usr/local/bin/emulator',
+      emulatorBin
+    ].filter((value): value is string => Boolean(value));
+
+    for (const candidate of candidates) {
+      if (candidate === emulatorBin) {
+        if (this.canRunHostCommand(candidate, ['-list-avds'])) {
+          console.log(`[ADB] 找到模拟器命令: ${candidate}`);
+          return candidate;
+        }
+        continue;
+      }
+
+      try {
+        if (existsSync(candidate) && statSync(candidate).isFile() && this.canRunHostCommand(candidate, ['-list-avds'])) {
+          console.log(`[ADB] 找到模拟器路径: ${candidate}`);
+          return candidate;
+        }
+      } catch {
+        // 忽略路径检测异常，继续尝试下一个候选项
+      }
+    }
+
+    console.warn('[ADB] 未找到 emulator 可执行文件，模拟器启动能力将不可用');
+    return null;
+  }
+
+  private async runEmulatorCommand(args: string[]): Promise<ShellCommandResult> {
+    if (!this.emulatorPath) {
+      return {
+        success: false,
+        stdout: '',
+        stderr: '未找到 emulator 可执行文件，请配置 EMULATOR_PATH 或 ANDROID_HOME',
+        exitCode: 1
+      };
+    }
+
+    return await new Promise<ShellCommandResult>((resolve) => {
+      const child = spawn(this.emulatorPath as string, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      child.on('error', (error: Error) => {
+        resolve({
+          success: false,
+          stdout,
+          stderr: `${stderr}${stderr ? '\n' : ''}${error.message}`,
+          exitCode: 1
+        });
+      });
+      child.on('close', (code) => {
+        resolve({
+          success: (typeof code === 'number' ? code : 1) === 0,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          exitCode: typeof code === 'number' ? code : 1
+        });
+      });
+    });
   }
 
   private async runADBCommand(command: string, deviceId?: string, options: { encoding?: string | null } = {}): Promise<ShellCommandResult> {
@@ -285,6 +425,304 @@ export class ADBManager {
   async waitForDevice(deviceId?: string, timeout: number = 30000): Promise<boolean> {
     const result = await this.runADBCommand('wait-for-device', deviceId);
     return result.success;
+  }
+
+  async listAvailableEmulators(): Promise<EmulatorCatalogResult> {
+    const runningDevices = (await this.listDevices())
+      .filter(device => device.id.startsWith('emulator-'))
+      .map(device => ({
+        id: device.id,
+        state: device.state,
+        model: device.model
+      }));
+
+    if (!this.emulatorPath) {
+      return {
+        emulatorPath: null,
+        availableAvds: [],
+        runningEmulators: runningDevices,
+        error: '未找到 emulator 可执行文件，请配置 EMULATOR_PATH 或 ANDROID_HOME'
+      };
+    }
+
+    const result = await this.runEmulatorCommand(['-list-avds']);
+    if (!result.success) {
+      return {
+        emulatorPath: this.emulatorPath,
+        availableAvds: [],
+        runningEmulators: runningDevices,
+        error: String(result.stderr || 'emulator -list-avds 执行失败')
+      };
+    }
+
+    const availableAvds = String(result.stdout || '')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    return {
+      emulatorPath: this.emulatorPath,
+      availableAvds,
+      runningEmulators: runningDevices
+    };
+  }
+
+  private async listEmulatorIdsFast(): Promise<string[]> {
+    const result = await this.runADBCommand('devices');
+    if (!result.success) {
+      return [];
+    }
+    const ids = String(result.stdout || '')
+      .split('\n')
+      .slice(1)
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map(line => line.split(/\s+/)[0])
+      .filter(id => id.startsWith('emulator-'));
+    return ids;
+  }
+
+  private async detectBootCompleted(emulatorId: string): Promise<boolean> {
+    const result = await this.runADBCommand('shell getprop sys.boot_completed', emulatorId);
+    if (!result.success) {
+      return false;
+    }
+    const output = String(result.stdout || '').trim();
+    return output === '1';
+  }
+
+  private async waitForEmulatorReady(options: {
+    baselineEmulatorIds: string[];
+    timeoutMs: number;
+    pollIntervalMs: number;
+    waitForBootCompleted: boolean;
+  }): Promise<{
+    success: boolean;
+    emulatorId?: string;
+    bootCompleted: boolean;
+    waitedMs: number;
+    error?: string;
+  }> {
+    const baseline = new Set(options.baselineEmulatorIds);
+    const start = Date.now();
+
+    while (Date.now() - start <= options.timeoutMs) {
+      const currentEmulatorIds = await this.listEmulatorIdsFast();
+      const newEmulatorId = currentEmulatorIds.find(id => !baseline.has(id));
+      const selectedId = newEmulatorId || (currentEmulatorIds.length === 1 ? currentEmulatorIds[0] : undefined);
+
+      if (selectedId) {
+        if (!options.waitForBootCompleted) {
+          return {
+            success: true,
+            emulatorId: selectedId,
+            bootCompleted: false,
+            waitedMs: Date.now() - start
+          };
+        }
+
+        const bootCompleted = await this.detectBootCompleted(selectedId);
+        if (bootCompleted) {
+          return {
+            success: true,
+            emulatorId: selectedId,
+            bootCompleted: true,
+            waitedMs: Date.now() - start
+          };
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, options.pollIntervalMs));
+    }
+
+    return {
+      success: false,
+      bootCompleted: false,
+      waitedMs: Date.now() - start,
+      error: `等待模拟器就绪超时（>${options.timeoutMs}ms）`
+    };
+  }
+
+  async startEmulator(options: EmulatorStartOptions): Promise<EmulatorStartResult> {
+    const avdName = options.avdName?.trim();
+    if (!avdName) {
+      return {
+        success: false,
+        avdName: options.avdName,
+        launched: false,
+        error: 'avdName 不能为空'
+      };
+    }
+
+    if (!this.emulatorPath) {
+      return {
+        success: false,
+        avdName,
+        launched: false,
+        emulatorPath: null,
+        error: '未找到 emulator 可执行文件，请配置 EMULATOR_PATH 或 ANDROID_HOME'
+      };
+    }
+
+    const catalog = await this.listAvailableEmulators();
+    if (catalog.availableAvds.length > 0 && !catalog.availableAvds.includes(avdName)) {
+      return {
+        success: false,
+        avdName,
+        launched: false,
+        emulatorPath: this.emulatorPath,
+        error: `未找到 AVD: ${avdName}（可用: ${catalog.availableAvds.join(', ') || 'none'}）`
+      };
+    }
+
+    const waitForReady = options.waitForReady !== false;
+    const waitForBootCompleted = options.waitForBootCompleted !== false;
+    const timeoutMs = Math.max(5000, options.timeoutMs || 180000);
+    const pollIntervalMs = Math.max(500, options.pollIntervalMs || 3000);
+    const baselineEmulatorIds = await this.listEmulatorIdsFast();
+
+    const args: string[] = ['-avd', avdName];
+
+    if (options.writableSystem === true) {
+      args.push('-writable-system');
+    }
+    if (options.noSnapshot === true) {
+      args.push('-no-snapshot');
+    }
+    if (options.selinux && options.selinux.trim()) {
+      args.push('-selinux', options.selinux.trim());
+    }
+    if (options.wifiTap && options.wifiTap.trim()) {
+      args.push('-wifi-tap', options.wifiTap.trim());
+    }
+    if (options.dnsServer && options.dnsServer.trim()) {
+      args.push('-dns-server', options.dnsServer.trim());
+    }
+    if (Array.isArray(options.extraArgs) && options.extraArgs.length > 0) {
+      args.push(...options.extraArgs.filter(arg => typeof arg === 'string').map(arg => arg.trim()).filter(Boolean));
+    }
+
+    try {
+      const child = spawn(this.emulatorPath, args, {
+        detached: true,
+        stdio: 'ignore',
+        shell: false
+      });
+      child.unref();
+
+      const commandPreview = `${this.emulatorPath} ${args.map(arg => (arg.includes(' ') ? `"${arg}"` : arg)).join(' ')}`;
+      console.log(`[ADB] 启动模拟器: ${commandPreview}`);
+      globalLogger.addLog({
+        type: 'info',
+        sessionId: 'adb',
+        data: {
+          action: 'start_emulator',
+          avdName,
+          emulatorPath: this.emulatorPath,
+          args,
+          pid: child.pid
+        }
+      });
+
+      if (!waitForReady) {
+        return {
+          success: true,
+          avdName,
+          launched: true,
+          pid: child.pid,
+          emulatorPath: this.emulatorPath,
+          args,
+          command: commandPreview,
+          waitForReady,
+          waitForBootCompleted,
+          ready: false,
+          bootCompleted: false,
+          timeoutMs,
+          pollIntervalMs,
+          waitedMs: 0
+        };
+      }
+
+      const waitResult = await this.waitForEmulatorReady({
+        baselineEmulatorIds,
+        timeoutMs,
+        pollIntervalMs,
+        waitForBootCompleted
+      });
+
+      return {
+        success: waitResult.success,
+        avdName,
+        launched: true,
+        pid: child.pid,
+        emulatorPath: this.emulatorPath,
+        args,
+        command: commandPreview,
+        emulatorId: waitResult.emulatorId,
+        waitForReady,
+        waitForBootCompleted,
+        ready: waitResult.success,
+        bootCompleted: waitResult.bootCompleted,
+        timeoutMs,
+        pollIntervalMs,
+        waitedMs: waitResult.waitedMs,
+        error: waitResult.success ? undefined : waitResult.error
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        avdName,
+        launched: false,
+        emulatorPath: this.emulatorPath,
+        args,
+        error: error?.message || String(error)
+      };
+    }
+  }
+
+  async stopEmulator(emulatorId?: string): Promise<EmulatorStopResult> {
+    let targetId = emulatorId?.trim();
+
+    if (!targetId) {
+      const running = (await this.listDevices()).filter(device => device.id.startsWith('emulator-'));
+      if (running.length === 0) {
+        return {
+          success: false,
+          error: '当前没有运行中的模拟器'
+        };
+      }
+      if (running.length > 1) {
+        return {
+          success: false,
+          error: '检测到多个模拟器，请指定 emulator_id',
+          candidates: running.map(device => device.id)
+        };
+      }
+      targetId = running[0].id;
+    }
+
+    const result = await this.runADBCommand('emu kill', targetId);
+    if (!result.success) {
+      return {
+        success: false,
+        emulatorId: targetId,
+        error: String(result.stderr || result.stdout || 'emu kill 执行失败')
+      };
+    }
+
+    globalLogger.addLog({
+      type: 'info',
+      sessionId: 'adb',
+      data: {
+        action: 'stop_emulator',
+        emulatorId: targetId
+      }
+    });
+
+    return {
+      success: true,
+      emulatorId: targetId
+    };
   }
 
   setCurrentDevice(deviceId: string): void {

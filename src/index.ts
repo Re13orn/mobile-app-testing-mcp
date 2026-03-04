@@ -785,6 +785,91 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ['device_id'],
         },
       },
+      {
+        name: 'adb_list_emulators',
+        description: '列出可启动的 Android 模拟器（AVD）以及当前运行中的模拟器实例',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'adb_start_emulator',
+        description: '启动 Android 模拟器（支持 writable-system/no-snapshot/selinux/wifi-tap/dns-server）',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            avd_name: {
+              type: 'string',
+              description: 'AVD 名称（可通过 adb_list_emulators 获取）',
+            },
+            writable_system: {
+              type: 'boolean',
+              description: '是否添加 -writable-system',
+              default: true,
+            },
+            no_snapshot: {
+              type: 'boolean',
+              description: '是否添加 -no-snapshot',
+              default: true,
+            },
+            selinux: {
+              type: 'string',
+              description: 'SELinux 模式（如 permissive/enforcing）',
+            },
+            wifi_tap: {
+              type: 'string',
+              description: '网卡名（如 en0，对应 -wifi-tap）',
+            },
+            dns_server: {
+              type: 'string',
+              description: 'DNS 列表（如 8.8.8.8,114.114.114.114）',
+            },
+            extra_args: {
+              type: 'array',
+              description: '附加 emulator 参数（字符串数组）',
+              items: {
+                type: 'string',
+              },
+            },
+            wait_for_ready: {
+              type: 'boolean',
+              description: '是否等待模拟器就绪后再返回',
+              default: true,
+            },
+            wait_for_boot_completed: {
+              type: 'boolean',
+              description: 'wait_for_ready=true 时，是否等待 sys.boot_completed=1',
+              default: true,
+            },
+            timeout_ms: {
+              type: 'number',
+              description: '等待就绪超时（毫秒，默认180000）',
+              default: 180000,
+            },
+            poll_interval_ms: {
+              type: 'number',
+              description: '轮询间隔（毫秒，默认3000）',
+              default: 3000,
+            },
+          },
+          required: ['avd_name'],
+        },
+      },
+      {
+        name: 'adb_stop_emulator',
+        description: '关闭模拟器（等价于 adb -s <emulator-id> emu kill）',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            emulator_id: {
+              type: 'string',
+              description: '模拟器设备ID（如 emulator-5554，留空时自动选择）',
+            },
+          },
+          required: [],
+        },
+      },
 
       // ===== ADB 应用管理工具 =====
       {
@@ -815,6 +900,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             device_id: {
               type: 'string',
               description: '指定设备ID（可选）',
+            },
+            timeout_ms: {
+              type: 'number',
+              description: '执行超时（毫秒，默认180000）',
+              default: 180000,
+            },
+            retry_count: {
+              type: 'number',
+              description: '失败重试次数（默认1）',
+              default: 1,
+            },
+            retry_delay_ms: {
+              type: 'number',
+              description: '重试间隔（毫秒，默认1500）',
+              default: 1500,
+            },
+            wait_after_install_ms: {
+              type: 'number',
+              description: '安装成功后额外等待时长（毫秒，默认3000）',
+              default: 3000,
             },
           },
           required: ['apk_path'],
@@ -1972,23 +2077,223 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      // ===== ADB 应用管理工具 =====
-      case 'adb_install_app': {
-        const { apk_path, replace = false, test = false, downgrade = false, device_id } = args as {
-          apk_path: string; replace?: boolean; test?: boolean; downgrade?: boolean; device_id?: string;
+      case 'adb_list_emulators': {
+        const result = await adbManager.listAvailableEmulators();
+        const avdText = result.availableAvds.length > 0
+          ? result.availableAvds.map(name => `• ${name}`).join('\n')
+          : '（无可用 AVD）';
+        const runningText = result.runningEmulators.length > 0
+          ? result.runningEmulators.map(item => `• ${item.id} (${item.state})${item.model ? ` - ${item.model}` : ''}`).join('\n')
+          : '（当前无运行中的模拟器）';
+        const structured = {
+          emulatorPath: result.emulatorPath,
+          availableAvds: result.availableAvds,
+          runningEmulators: result.runningEmulators,
+          error: result.error || null
         };
-        
-        const success = await adbManager.installApp(apk_path, { 
-          replace, test, downgrade, deviceId: device_id 
-        });
         
         return {
           content: [
             {
               type: 'text',
-              text: success 
-                ? `✅ 应用安装成功: ${apk_path}`
-                : `❌ 应用安装失败: ${apk_path}`,
+              text: `${result.error ? '⚠️' : '✅'} 模拟器查询结果\n` +
+                    `emulator 路径: ${result.emulatorPath || '未检测到'}\n` +
+                    `${result.error ? `错误: ${result.error}\n` : ''}\n` +
+                    `可启动 AVD:\n${avdText}\n\n` +
+                    `运行中模拟器:\n${runningText}\n\n` +
+                    `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
+            },
+          ],
+        };
+      }
+
+      case 'adb_start_emulator': {
+        const {
+          avd_name,
+          writable_system = true,
+          no_snapshot = true,
+          selinux,
+          wifi_tap,
+          dns_server,
+          extra_args,
+          wait_for_ready = true,
+          wait_for_boot_completed = true,
+          timeout_ms,
+          poll_interval_ms
+        } = args as {
+          avd_name: string;
+          writable_system?: boolean;
+          no_snapshot?: boolean;
+          selinux?: string;
+          wifi_tap?: string;
+          dns_server?: string;
+          extra_args?: string[];
+          wait_for_ready?: boolean;
+          wait_for_boot_completed?: boolean;
+          timeout_ms?: number;
+          poll_interval_ms?: number;
+        };
+
+        const timeoutMs = clampInt(timeout_ms, 180000, 5000, 600000);
+        const pollIntervalMs = clampInt(poll_interval_ms, 3000, 500, 10000);
+        const result = await adbManager.startEmulator({
+          avdName: avd_name,
+          writableSystem: writable_system,
+          noSnapshot: no_snapshot,
+          selinux,
+          wifiTap: wifi_tap,
+          dnsServer: dns_server,
+          extraArgs: extra_args,
+          waitForReady: wait_for_ready,
+          waitForBootCompleted: wait_for_boot_completed,
+          timeoutMs,
+          pollIntervalMs
+        });
+        const structured = {
+          success: result.success,
+          launched: result.launched,
+          avdName: result.avdName,
+          pid: result.pid || null,
+          emulatorPath: result.emulatorPath || null,
+          args: result.args || [],
+          command: result.command || null,
+          emulatorId: result.emulatorId || null,
+          ready: result.ready ?? null,
+          bootCompleted: result.bootCompleted ?? null,
+          waitForReady: result.waitForReady ?? null,
+          waitForBootCompleted: result.waitForBootCompleted ?? null,
+          waitedMs: result.waitedMs ?? null,
+          timeoutMs: result.timeoutMs ?? timeoutMs,
+          pollIntervalMs: result.pollIntervalMs ?? pollIntervalMs,
+          error: result.error || null
+        };
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: result.success
+                ? `🚀 模拟器启动请求已提交: ${result.avdName}\n` +
+                  `PID: ${result.pid}\n` +
+                  `${result.emulatorId ? `设备ID: ${result.emulatorId}\n` : ''}` +
+                  `${typeof result.waitedMs === 'number' ? `等待耗时: ${result.waitedMs}ms\n` : ''}` +
+                  `命令: ${result.command}\n` +
+                  `${wait_for_ready ? '状态: 已等待就绪完成\n' : '状态: 已提交启动（未等待就绪）\n'}` +
+                  `提示: 启动和引导通常需要 20~90 秒，可用 adb_list_devices 查看状态。\n\n` +
+                  `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``
+                : `❌ 模拟器启动失败: ${result.avdName}\n` +
+                  `错误: ${result.error || 'unknown'}\n\n` +
+                  `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
+            },
+          ],
+        };
+      }
+
+      case 'adb_stop_emulator': {
+        const { emulator_id } = args as { emulator_id?: string };
+        const result = await adbManager.stopEmulator(emulator_id);
+        const structured = {
+          success: result.success,
+          emulatorId: result.emulatorId || null,
+          candidates: result.candidates || [],
+          error: result.error || null
+        };
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: result.success
+                ? `🛑 模拟器关闭成功: ${result.emulatorId}\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``
+                : `❌ 模拟器关闭失败: ${result.error || 'unknown'}${result.candidates && result.candidates.length > 0 ? `\n候选模拟器: ${result.candidates.join(', ')}` : ''}\n\n结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
+            },
+          ],
+        };
+      }
+
+      // ===== ADB 应用管理工具 =====
+      case 'adb_install_app': {
+        const {
+          apk_path,
+          replace = false,
+          test = false,
+          downgrade = false,
+          device_id,
+          wait_after_install_ms
+        } = args as {
+          apk_path: string;
+          replace?: boolean;
+          test?: boolean;
+          downgrade?: boolean;
+          device_id?: string;
+          wait_after_install_ms?: number;
+        };
+
+        const resilience = parseResilienceOptions(args as Record<string, unknown>, {
+          timeoutMs: 180000,
+          retryCount: 1,
+          retryDelayMs: 1500
+        });
+        const waitAfterMs = clampInt(wait_after_install_ms, 3000, 0, 120000);
+
+        const execResult = await executeWithResilience(
+          'adb_install_app',
+          () => adbManager.installApp(apk_path, {
+            replace,
+            test,
+            downgrade,
+            deviceId: device_id
+          }),
+          resilience,
+          result => result === true,
+          () => `应用安装失败: ${apk_path}`
+        );
+
+        if (execResult.success && waitAfterMs > 0) {
+          await sleep(waitAfterMs);
+        }
+
+        const assessment = buildToolAssessment(
+          'adb_install_app',
+          execResult.success,
+          execResult.code,
+          `apk=${apk_path}; device=${device_id || 'default'}`,
+          execResult.error
+        );
+        const structured = {
+          apkPath: apk_path,
+          replace,
+          test,
+          downgrade,
+          deviceId: device_id || null,
+          success: execResult.success,
+          code: execResult.code,
+          attempts: execResult.attempts,
+          durationMs: execResult.durationMs,
+          timeoutMs: resilience.timeoutMs,
+          retryCount: resilience.maxAttempts - 1,
+          waitAfterInstallMs: waitAfterMs,
+          error: execResult.error || null,
+          assessment
+        };
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: execResult.success
+                ? `✅ 应用安装成功: ${apk_path}\n` +
+                  `状态码: ${execResult.code}\n` +
+                  `尝试次数: ${execResult.attempts}\n` +
+                  `安装耗时: ${execResult.durationMs}ms\n` +
+                  `安装后等待: ${waitAfterMs}ms\n\n` +
+                  `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``
+                : `❌ 应用安装失败: ${apk_path}\n` +
+                  `状态码: ${execResult.code}\n` +
+                  `尝试次数: ${execResult.attempts}\n` +
+                  `耗时: ${execResult.durationMs}ms\n` +
+                  `错误: ${execResult.error || 'unknown'}\n\n` +
+                  `结构化结果:\n\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\``,
             },
           ],
         };

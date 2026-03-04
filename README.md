@@ -93,6 +93,7 @@ npm run dev      # 构建后启动（同 start）
 - `ADB_PATH`：adb 可执行文件绝对路径（可选）
 - `AAPT_PATH`：aapt 可执行文件绝对路径（可选）
 - `JADX_PATH`：jadx 可执行文件绝对路径（可选）
+- `EMULATOR_PATH`：Android emulator 可执行文件路径（可选，支持 AVD 列表/启动/关闭）
 - `AUTO_DOWNLOAD_JADX`：是否自动下载 JADX（默认 `true`）
 - `JADX_VERSION`：自动下载版本（默认 `1.5.5`）
 - `JADX_DOWNLOAD_URL`：JADX 下载 URL（可覆盖默认地址）
@@ -124,9 +125,9 @@ npm run dev      # 构建后启动（同 start）
 
 ## 🧰 工具能力清单
 
-当前总计 `43` 个工具：
+当前总计 `46` 个工具：
 
-- ADB 工具 `22`：设备、应用、文件、输入模拟、截屏录屏
+- ADB 工具 `25`：设备、模拟器（AVD 列表/启动/关闭）、应用、文件、输入模拟、截屏录屏
 - AAPT 工具 `4`：badging、permissions、xmltree、完整分析
 - JADX 工具 `3`：反编译、输出信息、APK 验证
 - 静态分析工具 `4`：secrets/debug/weak-crypto/comprehensive（含统一报告导出）
@@ -141,6 +142,8 @@ npm run dev      # 构建后启动（同 start）
 分析这个 APK 的基础信息：/path/to/app.apk
 反编译这个 APK 并输出关键目录：/path/to/app.apk
 对当前连接设备截图并保存到默认目录
+查看可启动模拟器并启动：adb_list_emulators / adb_start_emulator
+关闭模拟器：adb_stop_emulator（或指定 emulator_id）
 对反编译目录做全面静态分析，并导出 json/md/sarif 报告到 /tmp/reports
 先做会话预检：workflow_session_precheck
 执行一键复现流水线并导出证据包：workflow_run_repro_pipeline
@@ -160,6 +163,15 @@ npm run dev      # 构建后启动（同 start）
 - `timeout_ms`: 超时控制
 - `retry_count`: 重试次数
 - `retry_delay_ms`: 重试间隔
+
+`adb_start_emulator` 支持启动等待参数：
+- `wait_for_ready`: 是否等待模拟器就绪（默认 `true`）
+- `wait_for_boot_completed`: 是否等待 `sys.boot_completed=1`（默认 `true`）
+- `timeout_ms` / `poll_interval_ms`: 启动等待超时与轮询间隔
+
+`adb_install_app` 支持安装等待参数：
+- `timeout_ms` / `retry_count` / `retry_delay_ms`: 安装执行的超时与重试
+- `wait_after_install_ms`: 安装成功后额外等待（默认 `3000`）
 
 ## 📚 Prompt 示例
 
